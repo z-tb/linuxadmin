@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# print changes in one line
+ANSIBLE_OUTPUT=
+
+# default to today
+num_days=0
+
+error()
+{
+   echo -e "\033[1;31;40mError :\033[0;0m$*"
+   exit 1
+}
+
+warning()
+{
+   echo -e "\033[1;33;40mWarning :\033[0;0m$*"
+}
+
+# output for single line
+ansible_output()
+{
+   while read line; do
+      #echo "ansi:$line"
+      o=$(echo "$line" | cut -d' ' -f4-)
+      echo -n "$o:::"
+   done < <(grep $(date --date="$start_date" +%Y-%m-%d) /var/log/dpkg.log | egrep '( installed | remove )')
+}
+
+usage()
+{
+   echo "Display package history for today (or past)"
+   echo "$0 <-d days>"
+   echo "-d  start -d days back"
+   echo "-a  ansible single line output"
+   exit 1
+}
+
+
+# find out what the command line options are is
+while getopts "had:" opt; do
+   case $opt in
+      h)
+         usage
+      ;;
+
+      d)
+         num_days="$OPTARG"
+      ;;
+
+      a)
+         ANSIBLE_OUTPUT="yes"
+      ;;
+
+      \?)
+         echo "Invalid option: $OPTARG" >&2
+         usage
+      ;;
+   esac
+done
+
+
+while [ "$num_days" -ge 0 ]; do
+   start_date=$(date --date="$num_days day ago")
+   test -n "${ANSIBLE_OUTPUT}" && ansible_output ||  grep $(date --date="$start_date" +%Y-%m-%d) /var/log/dpkg.log | egrep '( installed | remove )' 
+   num_days=$(echo "$num_days-1"|bc -l)
+done
