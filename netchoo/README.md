@@ -4,7 +4,7 @@ A real-time network traffic monitoring application written using Python, GTK3 an
 
 Here we can see Netchoo in action as it downloads a tarball from kernel.org, then uploads it to an s3 bucket for no other reason than to generate a nice graph.
 
-![Netchoo in action](./images/shot2.png)
+![Netchoo in action](images/shot2.png)
 
 ## Features
 
