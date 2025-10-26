@@ -11,6 +11,13 @@ Features:
 """
 
 # ---------------------------
+# GTK Window constants
+# ---------------------------
+WINDOW_SECONDS = 300  # Show last 5 minutes of data
+SAMPLE_INTERVAL = 0.2  # seconds between GPU metric reads
+RENDER_FPS = 30  # frames per second for drawing
+
+# ---------------------------
 # GTK imports
 # ---------------------------
 import gi
@@ -182,12 +189,7 @@ class GPUReader:
         except Exception:
             return {}
 
-# ---------------------------
-# GTK Window constants
-# ---------------------------
-WINDOW_SECONDS = 300  # Show last 5 minutes of data
-SAMPLE_INTERVAL = 0.5  # seconds between GPU metric reads
-RENDER_FPS = 30  # frames per second for drawing
+
 
 # ---------------------------
 # GPUWindow: GTK main window
@@ -198,11 +200,12 @@ class GPUWindow(Gtk.Window):
     Draws live graphs for GPU metrics, shows bottom status summary.
     Provides File, View, Help menus.
     """
-    def __init__(self):
+    def __init__(self, dots_mode=None):
         super().__init__(title="gpuck")
         self.set_icon(get_embedded_icon_pixbuf())  # Set window icon
         self.set_default_size(1000, 600)  # Initial size
 
+        self.dots_mode = set(dots_mode) if dots_mode else set()  # Metrics to plot as dots only
         self.reader = GPUReader()  # GPU reader instance
         self.metrics = {k: MetricBuffer() for k in
                         ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "Power_watts", "fan_%"]}
@@ -332,7 +335,7 @@ class GPUWindow(Gtk.Window):
             cr.move_to(x0 + 2, min(max(y, y0 + extents.height), y1 - 2))
             cr.show_text(text)
             
-    def on_draw(self, widget, cr):        
+    def on_draw(self, widget, cr):
         """Draw all visible metrics as scrolling graphs with legends."""
         alloc = widget.get_allocation()
         w, h = alloc.width, alloc.height
@@ -346,7 +349,9 @@ class GPUWindow(Gtk.Window):
 
         margin, rows = 8, len(keys)
         row_h = (h - (rows + 1) * margin) / rows
-        now, start = time.time(), time.time() - WINDOW_SECONDS
+        # Use wall-clock time for continuous smooth scrolling
+        now = time.time()
+        start = now - WINDOW_SECONDS
 
         colors = {
             "gpu_temp": (1, 0.4, 0.3),
@@ -374,25 +379,49 @@ class GPUWindow(Gtk.Window):
 
             self.draw_grid(cr, plot_x0, plot_y0, plot_x1, plot_y1, ymin, ymax)
 
-            # draw metric line - OPTIMIZED: sample every 2-3 pixels instead of every pixel
-            path = []
-            plot_width = int(plot_x1 - plot_x0)
-            step = max(1, plot_width // 500)  # Limit to ~500 points max
-            
-            for px in range(int(plot_x0), int(plot_x1), step):
-                t = start + ((px - plot_x0) / (plot_x1 - plot_x0)) * WINDOW_SECONDS
-                v = self.metrics[k].get_value_at(t)
-                if math.isnan(v): continue
-                v = max(ymin, min(ymax, v))
-                y = plot_y1 - (v - ymin) / (ymax - ymin) * (plot_y1 - plot_y0)
-                path.append((px, y))
-            
-            if path:
-                cr.set_source_rgb(*colors[k])
+            cr.set_source_rgb(*colors[k])
+            plot_width = plot_x1 - plot_x0
+
+            # Draw either dots or lines depending on dots_mode
+            if k in self.dots_mode:
+                # Plot only dots at data points
+                cr.set_line_width(1.0)
+                for t_sample, v_sample in self.metrics[k].samples:
+                    if t_sample < start or t_sample > start + WINDOW_SECONDS:
+                        continue
+                    v = max(ymin, min(ymax, v_sample))
+                    x = plot_x0 + ((t_sample - start) / WINDOW_SECONDS) * plot_width
+                    y = plot_y1 - (v - ymin) / (ymax - ymin) * (plot_y1 - plot_y0)
+                    # Draw a small dot (3x3 pixels)
+                    cr.arc(x, y, 1.5, 0, 2 * math.pi)
+                    cr.fill()
+            else:
+                # Draw metric line with per-pixel sampling for smooth curves
+                # Sample at every pixel for maximum smoothness without jiggling
                 cr.set_line_width(2.0)
-                cr.move_to(*path[0])
-                for x, y in path[1:]:
-                    cr.line_to(x, y)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.set_line_join(cairo.LINE_JOIN_ROUND)
+
+                first_point = True
+                for px in range(int(plot_x0), int(plot_x1) + 1):
+                    # Map pixel to time, keeping fractional precision for smooth interpolation
+                    t = start + ((px - plot_x0) / plot_width) * WINDOW_SECONDS
+                    v = self.metrics[k].get_value_at(t)
+
+                    if math.isnan(v):
+                        first_point = True
+                        continue
+
+                    v = max(ymin, min(ymax, v))
+                    # Keep Y as float - let Cairo handle the rendering smoothly
+                    y = plot_y1 - (v - ymin) / (ymax - ymin) * (plot_y1 - plot_y0)
+
+                    if first_point:
+                        cr.move_to(px, y)
+                        first_point = False
+                    else:
+                        cr.line_to(px, y)
+
                 cr.stroke()
 
             # Draw legend text in center of graph (dark cyan)
@@ -412,7 +441,31 @@ class GPUWindow(Gtk.Window):
 # Entry point
 # ---------------------------
 def main():
-    win = GPUWindow()
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="gpuck - Real-time GTK GPU monitor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                                    # Show all metrics as lines
+  %(prog)s --dots gpu_temp                   # Show gpu_temp as dots only
+  %(prog)s --dots gpu_temp gpu_utilization_% # Show both as dots
+        """
+    )
+    parser.add_argument("--dots", nargs="*", default=None,
+                        help="Metrics to plot as dots only (space-separated). If --dots is specified with no metrics, all metrics will be dots.")
+    args = parser.parse_args()
+
+    # Handle --dots argument
+    dots_mode = None
+    if args.dots is not None:
+        if len(args.dots) == 0:
+            # --dots with no arguments means all metrics as dots
+            dots_mode = ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "Power_watts", "fan_%"]
+        else:
+            dots_mode = args.dots
+
+    win = GPUWindow(dots_mode=dots_mode)
     win.connect("destroy", Gtk.main_quit)
     Gtk.main()
 
