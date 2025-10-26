@@ -22,7 +22,7 @@ RENDER_FPS = 30  # frames per second for drawing
 # ---------------------------
 import gi
 gi.require_version("Gtk", "3.0")  # Force PyGObject to use GTK 3
-from gi.repository import Gtk, GdkPixbuf, GLib  # Import GTK classes for GUI
+from gi.repository import Gtk, GdkPixbuf, GLib, Gdk  # Import GTK classes for GUI
 import cairo  # For drawing the graphs
 import time, math, collections, subprocess, threading  # Standard utilities
 
@@ -35,6 +35,15 @@ try:
     PYNVML = True
 except Exception:
     PYNVML = False  # Fallback if pynvml is not installed
+
+# ---------------------------
+# CPU monitoring (psutil)
+# ---------------------------
+try:
+    import psutil  # For CPU and system metrics
+    PSUTIL = True
+except Exception:
+    PSUTIL = False  # Fallback if psutil is not installed
 
 # ---------------------------
 # Embedded SVG icon (stored as bytes)
@@ -163,7 +172,7 @@ class GPUReader:
             "gpu_temp": temp,
             "Gpu_Memory_%": mem_pct,
             "gpu_utilization_%": util,
-            "Power_watts": power,
+            "gpu_watts": power,
             "fan_%": fan,
         }
 
@@ -183,13 +192,56 @@ class GPUReader:
                 "gpu_temp": t,
                 "Gpu_Memory_%": mem_pct,
                 "gpu_utilization_%": util,
-                "Power_watts": pwr,
+                "gpu_watts": pwr,
                 "fan_%": fan,
             }
         except Exception:
             return {}
 
+# ---------------------------
+# CPU monitoring
+# ---------------------------
+class CPUReader:
+    """
+    Reads CPU metrics using psutil.
+    Thread-safe to avoid conflicts with GTK GUI.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.available = PSUTIL
 
+    def read(self):
+        """Return current CPU metrics as a dictionary."""
+        with self.lock:
+            if not self.available:
+                return {}
+            try:
+                cpu_percent = psutil.cpu_percent(interval=0)
+                cpu_temp = None
+                cpu_watts = None
+
+                # Try to get CPU temperature if available
+                try:
+                    temps = psutil.sensors_temperatures()
+                    if 'coretemp' in temps:
+                        cpu_temp = temps['coretemp'][0].current
+                    elif 'acpitz' in temps:
+                        cpu_temp = temps['acpitz'][0].current
+                    else:
+                        # Use first available temperature sensor
+                        for sensor_name, readings in temps.items():
+                            if readings:
+                                cpu_temp = readings[0].current
+                                break
+                except Exception:
+                    cpu_temp = None
+
+                result = {"cpu_utilization_%": cpu_percent}
+                if cpu_temp is not None:
+                    result["cpu_temp"] = cpu_temp
+                return result
+            except Exception:
+                return {}
 
 # ---------------------------
 # GPUWindow: GTK main window
@@ -206,9 +258,13 @@ class GPUWindow(Gtk.Window):
         self.set_default_size(1000, 600)  # Initial size
 
         self.dots_mode = set(dots_mode) if dots_mode else set()  # Metrics to plot as dots only
-        self.reader = GPUReader()  # GPU reader instance
+        self.gpu_reader = GPUReader()  # GPU reader instance
+        self.cpu_reader = CPUReader()  # CPU reader instance
+
+        # Metric keys: GPU metrics + CPU metrics
         self.metrics = {k: MetricBuffer() for k in
-                        ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "Power_watts", "fan_%"]}
+                        ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "gpu_watts", "fan_%",
+                         "cpu_temp", "cpu_utilization_%"]}
 
         vbox = Gtk.VBox(spacing=6)
         self.add(vbox)
@@ -257,12 +313,24 @@ class GPUWindow(Gtk.Window):
         # Drawing area for GPU graphs
         self.da = Gtk.DrawingArea()
         self.da.connect("draw", self.on_draw)
+        self.da.connect("motion-notify-event", self.on_mouse_move)
+        self.da.connect("leave-notify-event", self.on_mouse_leave)
+        self.da.set_events(self.da.get_events() |
+                          Gdk.EventMask.POINTER_MOTION_MASK |
+                          Gdk.EventMask.LEAVE_NOTIFY_MASK)
         vbox.pack_start(self.da, True, True, 0)
 
-        # Status label at bottom
-        self.status = Gtk.Label(label="Initializing…")
+        # Status label at bottom with Pango markup support for colors
+        self.status = Gtk.Label(label="gpuck v1.0")
+        self.status.set_use_markup(True)  # Enable Pango markup for colorization
         self.status.set_xalign(0)
         vbox.pack_end(self.status, False, False, 4)
+
+        # Mouse tracking state
+        self.hovered_metric = None  # Currently hovered metric
+        self.hover_x = 0
+        self.hover_y = 0
+        self.graph_areas = {}  # Map metric name to (x0, y0, x1, y1) coordinates
 
         # Setup periodic GPU sampling and drawing refresh
         GLib.timeout_add(int(SAMPLE_INTERVAL * 1000), self.sample)
@@ -292,23 +360,105 @@ class GPUWindow(Gtk.Window):
         dialog.run()
         dialog.destroy()
 
+    def on_mouse_move(self, widget, event):
+        """Handle mouse movement over the graph area."""
+        self.hover_x = event.x
+        self.hover_y = event.y
+
+        # Check which graph is being hovered
+        hovered = None
+        for metric_name, (x0, y0, x1, y1) in self.graph_areas.items():
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                hovered = metric_name
+                break
+
+        if hovered != self.hovered_metric:
+            self.hovered_metric = hovered
+            self.update_status_for_hover()
+
+        return False
+
+    def on_mouse_leave(self, widget, event):
+        """Handle mouse leaving the graph area."""
+        self.hovered_metric = None
+        self.status.set_markup("gpuck v1.0")
+        return False
+
+    def update_status_for_hover(self):
+        """Update status bar based on currently hovered metric."""
+        if not self.hovered_metric:
+            self.status.set_markup("gpuck v1.0")
+            return
+
+        metric_name = self.hovered_metric
+        samples = self.metrics[metric_name].samples
+
+        if not samples:
+            metric_display = metric_name.replace("_", " ").capitalize()
+            self.status.set_markup(f"{metric_display}: No data")
+            return
+
+        # Extract values from samples
+        values = [v for t, v in samples]
+        if not values:
+            return
+
+        current = values[-1]
+        high = max(values)
+        low = min(values)
+        avg = sum(values) / len(values)
+
+        # Get color for this metric (RGB tuple to hex)
+        colors = {
+            "gpu_temp": (1, 0.4, 0.3),
+            "Gpu_Memory_%": (0.3, 0.7, 1.0),
+            "gpu_utilization_%": (0.4, 1.0, 0.4),
+            "gpu_watts": (1.0, 0.8, 0.2),
+            "fan_%": (0.8, 0.5, 1.0),
+            "cpu_temp": (1.0, 0.6, 0.0),
+            "cpu_utilization_%": (0.6, 0.8, 1.0),
+        }
+
+        if metric_name in colors:
+            r, g, b = colors[metric_name]
+            hex_color = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+        else:
+            hex_color = "#00ffff"  # Default cyan
+
+        # Format based on metric type
+        metric_display = metric_name.replace("_", " ").capitalize()
+
+        if "%" in metric_name:
+            status_text = f"<span foreground='{hex_color}'><b>{metric_display}:</b> {current:.0f}% | <b>High:</b> {high:.0f}% | <b>Low:</b> {low:.0f}% | <b>Avg:</b> {avg:.0f}%</span>"
+        elif "temp" in metric_name:
+            status_text = f"<span foreground='{hex_color}'><b>{metric_display}:</b> {current:.0f}°C | <b>High:</b> {high:.0f}°C | <b>Low:</b> {low:.0f}°C | <b>Avg:</b> {avg:.0f}°C</span>"
+        elif "watts" in metric_name:
+            status_text = f"<span foreground='{hex_color}'><b>{metric_display}:</b> {current:.1f}W | <b>High:</b> {high:.1f}W | <b>Low:</b> {low:.1f}W | <b>Avg:</b> {avg:.1f}W</span>"
+        else:
+            status_text = f"<span foreground='{hex_color}'><b>{metric_display}:</b> {current:.1f} | <b>High:</b> {high:.1f} | <b>Low:</b> {low:.1f} | <b>Avg:</b> {avg:.1f}</span>"
+
+        self.status.set_markup(status_text)
+
     def sample(self):
-        """Read GPU metrics, append to buffers, prune old samples, update status label."""
-        data = self.reader.read()
+        """Read GPU and CPU metrics, append to buffers, prune old samples."""
+        gpu_data = self.gpu_reader.read()
+        cpu_data = self.cpu_reader.read()
+
+        # Merge GPU and CPU data
+        data = {}
+        data.update(gpu_data)
+        data.update(cpu_data)
+
         t = time.time()
-        if not data:
-            self.status.set_text("No NVIDIA GPU detected.")
+        if not gpu_data:
+            self.status.set_markup("<span foreground='#ff6666'><b>No NVIDIA GPU detected.</b></span>")
             return True
+
+        # Append all metrics to their buffers
         for k in self.metrics:
             self.metrics[k].append(t, data.get(k, float("nan")))
             self.metrics[k].prune(t - WINDOW_SECONDS)
-        self.status.set_text(
-            f"Temp: {data.get('gpu_temp','?'):.0f}°C | "
-            f"Util: {data.get('gpu_utilization_%','?'):.0f}% | "
-            f"Power: {data.get('Power_watts','?'):.1f} W | "
-            f"Mem: {data.get('Gpu_Memory_%','?'):.2f}% | "
-            f"Fan: {data.get('fan_%','?'):.0f}%"
-        )
+
         return True
 
     def refresh(self):
@@ -357,14 +507,23 @@ class GPUWindow(Gtk.Window):
             "gpu_temp": (1, 0.4, 0.3),
             "Gpu_Memory_%": (0.3, 0.7, 1.0),
             "gpu_utilization_%": (0.4, 1.0, 0.4),
-            "Power_watts": (1.0, 0.8, 0.2),
+            "gpu_watts": (1.0, 0.8, 0.2),
             "fan_%": (0.8, 0.5, 1.0),
+            "cpu_temp": (1.0, 0.6, 0.0),       # Orange for CPU temp
+            "cpu_utilization_%": (0.6, 0.8, 1.0),  # Light blue for CPU util
         }
+
+        # Clear graph areas for hover detection
+        self.graph_areas = {}
 
         for i, k in enumerate(keys):
             y0 = margin + i * (row_h + margin)
             plot_x0, plot_y0 = margin + 40, y0 + 10
             plot_x1, plot_y1 = w - margin - 5, y0 + row_h
+
+            # Store graph area for hover detection
+            self.graph_areas[k] = (plot_x0, plot_y0, plot_x1, plot_y1)
+
             cr.set_source_rgb(0.15, 0.15, 0.15)
             cr.rectangle(plot_x0, plot_y0, plot_x1 - plot_x0, plot_y1 - plot_y0)
             cr.fill()
@@ -372,7 +531,9 @@ class GPUWindow(Gtk.Window):
             # ranges per metric
             if k == "gpu_temp":
                 ymin, ymax = 20, 100
-            elif k == "Power_watts":
+            elif k == "cpu_temp":
+                ymin, ymax = 20, 100
+            elif k == "gpu_watts":
                 ymin, ymax = 0, 300
             else:
                 ymin, ymax = 0, 100
@@ -424,14 +585,32 @@ class GPUWindow(Gtk.Window):
 
                 cr.stroke()
 
-            # Draw legend text in center of graph (dark cyan)
+            # Draw legend text with current value at top of graph (dark cyan)
             cr.set_source_rgb(0.0, 0.55, 0.55)
             cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             cr.set_font_size(12)
-            legend = k.replace("_", " ").capitalize()
+
+            # Get the current (most recent) value for this metric
+            if self.metrics[k].samples:
+                current_value = self.metrics[k].samples[-1][1]
+                # Format value with appropriate precision
+                if "%" in k:
+                    value_str = f"{current_value:.0f}%"
+                elif "temp" in k:
+                    value_str = f"{current_value:.0f}°C"
+                elif "watts" in k:
+                    value_str = f"{current_value:.1f}W"
+                else:
+                    value_str = f"{current_value:.1f}"
+
+                legend = f"{k.replace('_', ' ').capitalize()}: {value_str}"
+            else:
+                legend = k.replace("_", " ").capitalize()
+
             extents = cr.text_extents(legend)
-            cx = (plot_x0 + plot_x1) / 2 - extents.width / 2
-            cy = (plot_y0 + plot_y1) / 2 + extents.height / 2
+            # Place at top-left of graph area with small padding
+            cx = plot_x0 + 4
+            cy = plot_y0 + extents.height + 2
             cr.move_to(cx, cy)
             cr.show_text(legend)
 
