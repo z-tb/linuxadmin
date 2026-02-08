@@ -77,8 +77,12 @@ def print_interface_table(interfaces, eth_names=None):
     print(colored("+" + "-" * 82 + "+", "cyan"))
     for iface in interfaces:
         new_name = "?" if eth_names is None else eth_names.get(iface['name'], "?")
-        print("| {:<15} | {:<10} | {:<8} | {:<18} | {:<15} |".format(
-            iface['name'], new_name, iface['type'], iface['mac'], iface['ip']))
+        row = "| {:<15} | {:<10} | {:<8} | {:<18} | {:<15} |".format(
+            iface['name'], new_name, iface['type'], iface['mac'], iface['ip'])
+        if iface['type'] == 'phy':
+            print(colored(row, "green"))
+        else:
+            print(row)
     print(colored("+" + "-" * 82 + "+", "cyan"))
 
 def prompt_for_eth_names(interfaces):
@@ -94,6 +98,8 @@ def prompt_for_eth_names(interfaces):
             continue
         while True:
             new_name = input(colored(f"Enter new ethX name for {iface['name']} ({iface['mac']}): ", "cyan")).strip()
+            if new_name == "":
+                break
             if not re.match(r'^eth[0-9]+$', new_name):
                 print(colored("Warning: Name should be in ethX format (e.g., eth0, eth1).", "yellow"))
                 continue
@@ -104,21 +110,113 @@ def prompt_for_eth_names(interfaces):
             break
     return eth_names
 
+def check_and_prompt_grub_config():
+    """Check GRUB config for net.ifnames=0 and biosdevname=0, prompt if missing"""
+    grub_cfg = "/etc/default/grub"
+    try:
+        with open(grub_cfg, "r") as f:
+            content = f.read()
+        
+        # Find the GRUB_CMDLINE_LINUX_DEFAULT line
+        cmdline_match = re.search(r'GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"', content)
+        if not cmdline_match:
+            print(colored("\nWarning: Could not find GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub", "yellow"))
+            return
+        
+        cmdline = cmdline_match.group(1)
+        needs_net_ifnames = "net.ifnames=0" not in cmdline
+        needs_biosdevname = "biosdevname=0" not in cmdline
+        
+        if not (needs_net_ifnames or needs_biosdevname):
+            print(colored("\nGRUB configuration already contains net.ifnames=0 and biosdevname=0. No changes needed.", "green"))
+            return
+        
+        # Build the new cmdline
+        new_cmdline = cmdline
+        if needs_net_ifnames:
+            new_cmdline += " net.ifnames=0"
+        if needs_biosdevname:
+            new_cmdline += " biosdevname=0"
+        
+        print(colored("\nGRUB Configuration Update Required:", "yellow"))
+        print(colored(f"Current line:\n  GRUB_CMDLINE_LINUX_DEFAULT=\"{cmdline}\"", "white"))
+        print(colored(f"\nWill be changed to:\n  GRUB_CMDLINE_LINUX_DEFAULT=\"{new_cmdline}\"", "green"))
+        print()
+        
+        response = input(colored("Update GRUB configuration? (yes/no): ", "cyan")).strip().lower()
+        if response in ('yes', 'y'):
+            new_content = content.replace(
+                f'GRUB_CMDLINE_LINUX_DEFAULT="{cmdline}"',
+                f'GRUB_CMDLINE_LINUX_DEFAULT="{new_cmdline}"'
+            )
+            with open(grub_cfg, "w") as f:
+                f.write(new_content)
+            print(colored(f"\nSuccessfully updated {grub_cfg}", "green"))
+            print(colored("Run 'sudo update-grub' to apply changes.\n", "cyan"))
+        else:
+            print(colored("\nSkipped GRUB configuration update. Please update manually if needed.\n", "yellow"))
+    except FileNotFoundError:
+        print(colored(f"\nWarning: {grub_cfg} not found", "yellow"))
+    except Exception as e:
+        print(colored(f"\nError checking GRUB config: {e}", "red"))
+
+def prompt_update_initramfs():
+    """Prompt user to update initramfs"""
+    print(colored("\nUpdate Initramfs Required:", "yellow"))
+    print(colored("The initramfs needs to be updated to recognize the new interface names.", "white"))
+    print()
+    response = input(colored("Update initramfs now? (yes/no): ", "cyan")).strip().lower()
+    if response in ('yes', 'y'):
+        try:
+            subprocess.check_call(["sudo", "update-initramfs", "-u"])
+            print(colored("\nSuccessfully updated initramfs.", "green"))
+        except subprocess.CalledProcessError:
+            print(colored("\nFailed to update initramfs. Please run 'sudo update-initramfs -u' manually.", "red"))
+        except Exception as e:
+            print(colored(f"\nError updating initramfs: {e}", "red"))
+    else:
+        print(colored("\nSkipped initramfs update. Please run 'sudo update-initramfs -u' before rebooting.", "yellow"))
+
 def write_udev_rules(eth_names, interfaces):
     """Write udev rules to /etc/udev/rules.d/70-persistent-net.rules for phy interfaces"""
     rules_path = "/etc/udev/rules.d/70-persistent-net.rules"
+    
+    # Build the rules content first
+    rules_lines = ["# Custom persistent network interface names\n"]
+    for iface in interfaces:
+        if iface['type'] != 'phy':
+            continue
+        if iface['name'] in eth_names:
+            rules_lines.append(f'SUBSYSTEM=="net", ACTION=="add", ATTR{{address}}=="{iface["mac"]}", NAME="{eth_names[iface["name"]]}"\n')
+    
+    # Display what will be written
+    print(colored("\nUdev rules to be written:", "cyan"))
+    print(colored("-" * 82, "cyan"))
+    for line in rules_lines:
+        print(line.rstrip())
+    print(colored("-" * 82, "cyan"))
+    print()
+    
+    # Prompt for confirmation
+    response = input(colored(f"Write to {rules_path}? (yes/no): ", "cyan")).strip().lower()
+    if response not in ('yes', 'y'):
+        print(colored("Cancelled. No changes were made.", "yellow"))
+        return
+    
     try:
         with open(rules_path, "w") as f:
-            f.write("# Custom persistent network interface names\n")
-            for iface in interfaces:
-                if iface['type'] != 'phy':
-                    continue
-                if iface['name'] in eth_names:
-                    f.write(f'SUBSYSTEM=="net", ACTION=="add", ATTR{{address}}=="{iface["mac"]}", NAME="{eth_names[iface["name"]]}"\n')
-        print(colored(f"\nSuccessfully wrote udev rules to {rules_path}", "cyan"))
-        print(colored("Please run the following commands to apply changes:\n", "cyan"))
-        print(colored("  sudo update-initramfs -u", "cyan"))
+            f.writelines(rules_lines)
+        print(colored(f"\nSuccessfully wrote udev rules to {rules_path}", "green"))
+        
+        # Check and prompt for GRUB configuration
+        check_and_prompt_grub_config()
+        
+        # Prompt to update initramfs
+        prompt_update_initramfs()
+        
+        print(colored("\nAfter making all changes, please reboot the system:", "cyan"))
         print(colored("  sudo reboot", "cyan"))
+        print()
     except Exception as e:
         print(colored(f"Error writing udev rules: {e}", "red"))
 
