@@ -147,6 +147,61 @@ def get_interface_info(filter_name=None):
         print(f"        RX: {rx_b / 1024 / 1024:.2f} MB  TX: {tx_b / 1024 / 1024:.2f} MB")
         print()
 
+
+
+
+def get_interface_info(filter_name=None):
+    """
+    Displays attributes for each interface with group-based coloring.
+    Returns True if matches are found, False otherwise.
+    """
+    interfaces = netifaces.interfaces()
+    interface_stats = get_interface_stats()
+
+    # Apply prefix filtering if an argument was provided
+    if filter_name:
+        interfaces = [i for i in interfaces if i.startswith(filter_name)]
+
+    # If no interfaces match the prefix, return False to the caller
+    if not interfaces:
+        return False
+
+    for interface in interfaces:
+        addrs = netifaces.ifaddresses(interface)
+        stats = interface_stats.get(interface, {})
+        if_clr = get_iface_color(interface)
+
+        print(f"{if_clr}{interface}:{Theme.RESET} flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500")
+
+        # IPv4
+        if netifaces.AF_INET in addrs:
+            for addr_info in addrs[netifaces.AF_INET]:
+                ip, mask = addr_info.get('addr'), addr_info.get('netmask')
+                if ip:
+                    clr = Theme.INET_PRI if ip != '127.0.0.1' else Theme.INET_SEC
+                    print(f"        inet {clr}{ip}{Theme.RESET}  netmask {if_clr}{mask}{Theme.RESET}")
+
+        # IPv6
+        if netifaces.AF_INET6 in addrs:
+            for addr_info in addrs[netifaces.AF_INET6]:
+                print(f"        inet6 {Theme.INET6}{addr_info.get('addr')}{Theme.RESET}  prefixlen {if_clr}64{Theme.RESET}")
+
+        # MAC Address
+        if netifaces.AF_LINK in addrs:
+            # Handle cases where MAC might not be present for certain virtual interfaces
+            link_info = addrs[netifaces.AF_LINK][0]
+            mac = link_info.get('addr', '00:00:00:00:00:00')
+            print(f"        ether {Theme.MAC}{mac}{Theme.RESET}  (Ethernet)")
+
+        # Stats
+        rx_b, tx_b = stats.get('rx_bytes', 0), stats.get('tx_bytes', 0)
+        print(f"        RX: {rx_b / 1024 / 1024:.2f} MB  TX: {tx_b / 1024 / 1024:.2f} MB")
+        print()
+
+    return True
+
+
+
 # -----------------------------------------------------------------------------
 # Function: get_routing_info
 # -----------------------------------------------------------------------------
@@ -217,19 +272,28 @@ def get_dns_info():
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     args = sys.argv[1:]
+    filter_name = args[0] if len(args) >= 1 else None
 
-    # Usage Case: ifconfig <interface> <ip> <up/down>
-    if len(args) >= 2:
-        modify_interface(args[0], args[1:])
-    
-    # Usage Case: ifconfig <partial_name>
-    elif len(args) == 1:
-        print(f"{Theme.HEADER} Filtering: {args[0]}* {Theme.RESET}\n")
-        get_interface_info(filter_name=args[0])
-    
-    # Standard Usage
+    # 1. Logic: Handle modifications first (if any)
+    if filter_name and len(args) >= 2:
+        modify_interface(filter_name, args[1:])
+
+    # 2. Validation: Check if the interface(s) exist before printing headers
+    all_ifaces = netifaces.interfaces()
+    found_ifaces = [i for i in all_ifaces if i.startswith(filter_name)] if filter_name else all_ifaces
+
+    if not found_ifaces:
+        # Print ONLY the error in red and exit
+        print(f"{Theme.ERROR}Error: No interfaces found with prefix '{filter_name}'.{Theme.RESET}")
+        sys.exit(0)
+
+    # 3. Printing: Now that we know they exist, print headers in order
+    if filter_name:
+        print(f"{Theme.HEADER} Filtering: {filter_name}* {Theme.RESET}\n")
     else:
         print(f"{Theme.HEADER} Network Interface Information {Theme.RESET}\n")
-        get_interface_info()
-        get_routing_info()
-        get_dns_info()
+
+    # 4. Display: Run the actual output functions
+    get_interface_info(filter_name=filter_name)
+    get_routing_info()
+    get_dns_info()
