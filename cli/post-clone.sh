@@ -32,6 +32,18 @@ CUR_DNS=$(grep -h -A 2 "nameservers:" /etc/netplan/*.y*ml 2>/dev/null | grep -oE
 # Fallback if discovery fails
 [[ -z "$CUR_DNS" ]] && CUR_DNS="8.8.8.8,1.1.1.1"
 
+# Scrape existing search domains - targets the search: key directly
+# Handles flow style:  search: [home.local, corp.example.com]
+CUR_SEARCH=$(grep -h -E '^\s*search:\s*\[' /etc/netplan/*.y*ml 2>/dev/null \
+    | grep -oP '(?<=\[)[^\]]+' \
+    | tr -d ' ' \
+    | head -1)
+# Also handle block-style list entries under search:
+if [[ -z "$CUR_SEARCH" ]]; then
+    CUR_SEARCH=$(awk '/^\s*search:/{f=1;next} f&&/^\s*-\s+\S/{gsub(/^\s*-\s+/,"");printf "%s,",$0;next} f{exit}' \
+        /etc/netplan/*.y*ml 2>/dev/null | sed 's/,$//')
+fi
+
 # ------------------------------------------------------------------------------
 # STAGE 1: DATA COLLECTION
 # ------------------------------------------------------------------------------
@@ -52,6 +64,16 @@ echo -ne "${MAGENTA}Global DNS (comma separated) ${NC}[$CUR_DNS]${MAGENTA}: ${NC
 read NEW_DNS
 NEW_DNS=${NEW_DNS:-$CUR_DNS}
 
+# Search domains - enter accepts existing value, 'none' explicitly clears it
+_search_display="${CUR_SEARCH:-none}"
+echo -ne "${MAGENTA}Search domains (comma-separated, 'none' to clear) ${NC}[$_search_display]${MAGENTA}: ${NC}"
+read NEW_SEARCH
+if [[ "$NEW_SEARCH" == "none" ]]; then
+    NEW_SEARCH=""
+else
+    NEW_SEARCH=${NEW_SEARCH:-$CUR_SEARCH}
+fi
+
 # Default Gateway
 CUR_GW=$(ip route | grep default | awk '{print $3}' | head -n1)
 VALID_GW=false
@@ -69,7 +91,8 @@ declare -A IF_CONFIGS
 for IFACE in $INTERFACES; do
     echo -e "${CYAN}--- Interface: $IFACE ---${NC}"
     CUR_IP=$(ip -4 addr show "$IFACE" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+' | head -n1)
-    
+    echo -e "  Current IP: ${YELLOW}${CUR_IP:-<none>}${NC}"
+
     DEF_DHCP=$([[ -z "$CUR_IP" ]] && echo "y" || echo "n")
     echo -ne "${MAGENTA}  Use DHCP for $IFACE? ${NC}[y/n, default: $DEF_DHCP]${MAGENTA}: ${NC}"
     read USE_DHCP
@@ -122,6 +145,9 @@ for IFACE in "${!IF_CONFIGS[@]}"; do
       nameservers:
         addresses: [${NEW_DNS}]
 EOF
+        if [[ -n "$NEW_SEARCH" ]]; then
+            echo "        search: [$NEW_SEARCH]" >> "$TMP_NETPLAN"
+        fi
         if [[ "$GW_BOOL" =~ ^[Yy]$ ]]; then
             cat <<EOF >> "$TMP_NETPLAN"
       routes:
@@ -135,6 +161,7 @@ done
 echo -e "\n${CYAN}>>> PROPOSED CHANGES <<<${NC}"
 echo -e "Hostname:   $NEW_HOSTNAME"
 echo -e "Regen SSH:  $REGEN_SSH"
+echo -e "Search:     ${NEW_SEARCH:-<none>}"
 echo -e "Netplan Config Preview:"
 cat "$TMP_NETPLAN"
 echo ""
@@ -181,6 +208,9 @@ netplan generate 2>/dev/null
 echo -e "${YELLOW}Finalizing Network...${NC}"
 echo -e "${RED}WARNING: If the IP of this interface changed, SSH will disconnect now.${NC}"
 
+# Clear stale generated configs before applying
+rm -f /run/netplan/*.yaml
+
 # Background the apply so the script can finish and SSH can close cleanly
 (sleep 2; netplan apply) &
 
@@ -191,3 +221,4 @@ ip -br addr show | grep -v "::1/128" | grep -v "fe80::" 2>/dev/null
 echo -ne "\n${MAGENTA}Reboot now? ${NC}[y/n, default: n]${MAGENTA}: ${NC}"
 read REBOOT_NOW
 [[ "$REBOOT_NOW" =~ ^[Yy]$ ]] && reboot || echo -e "${YELLOW}Manual reboot recommended to finish ID regeneration.${NC}"
+
