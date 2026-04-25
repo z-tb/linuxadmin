@@ -664,9 +664,9 @@ Examples:
     parser.add_argument("--stime", type=float, default=SAMPLE_INTERVAL,
                         metavar="SECONDS",
                         help=f"Sample time between readings in seconds (default: {SAMPLE_INTERVAL})")
-    parser.add_argument("--buffer-size", type=int, default=600,
+    parser.add_argument("--buffer-size", type=int, default=None,
                         metavar="SAMPLES",
-                        help="Number of samples to keep in history buffer (default: 600)")
+                        help="Number of samples to keep in history buffer (default: auto-sized to fill the window)")
     parser.add_argument("--metrics", nargs="+", default=None,
                         metavar="METRIC",
                         help="""Display only specified metrics (space-separated). Available metrics:
@@ -707,8 +707,13 @@ Examples:
             else:
                 print(f"Warning: Unknown metric '{shorthand}'. Use --help for available metrics.")
 
+    # Auto-size buffer to hold a full window of data plus some headroom
+    buffer_size = args.buffer_size
+    if buffer_size is None:
+        buffer_size = int(WINDOW_SECONDS / args.stime) + 100
+
     win = GPUWindow(dots_mode=dots_mode, sample_interval=args.stime,
-                    buffer_size=args.buffer_size, metric_visibility=metric_visibility)
+                    buffer_size=buffer_size, metric_visibility=metric_visibility)
     win.connect("destroy", Gtk.main_quit)
     Gtk.main()
 
