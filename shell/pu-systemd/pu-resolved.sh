@@ -1,4 +1,30 @@
 #!/bin/bash
+#
+# pu-resolved.sh - Patch Up: systemd-resolved Disabler
+#
+# Replaces systemd-resolved with a static /etc/resolv.conf pointing at
+# public DNS (Google 8.8.8.8/8.8.4.4, Cloudflare 1.1.1.1). Useful on
+# systems where systemd-resolved causes split-DNS issues, Docker DNS
+# or WiFI breakage,or VPN/WireGuard conflicts. 
+#
+# What it does:
+#   1. Stops and disables systemd-resolved.
+#   2. Replaces the resolv.conf symlink with a static file.
+#   3. Sets the immutable bit (chattr +i) if supported, preventing
+#      other services from overwriting it.
+#   4. Optionally restarts Docker (which caches resolv.conf at startup).
+#   5. Verifies DNS resolution works after the change.
+#
+# Undo mode (-u):
+#   Re-enables systemd-resolved, removes the immutable bit, and restores
+#   the default stub-resolv.conf symlink.
+#
+# Usage:
+#   sudo ./pu-resolved.sh       # disable systemd-resolved
+#   sudo ./pu-resolved.sh -u    # undo and re-enable
+#
+# Requires: root privileges
+#
 
 CYAN='\033[0;36m' RED='\033[0;31m' YELLOW='\033[1;33m' GREEN='\033[0;32m' NC='\033[0m'
 
@@ -38,6 +64,17 @@ ensure_regular_resolv() {
         rm -f /etc/resolv.conf
     fi
     touch /etc/resolv.conf
+}
+
+prompt_docker_restart() {
+    read -rp "Restart docker? [y/N]: " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        systemctl restart docker >/dev/null 2>&1 \
+            && success "Docker restarted" \
+            || warn "Docker restart failed"
+    else
+        warn "Docker restart skipped"
+    fi
 }
 
 update_resolv() {
@@ -113,10 +150,7 @@ if [[ $UNDO == false ]]; then
     systemctl disable systemd-resolved || { error "Disable failed"; exit 1; }
 
     update_resolv
-
-    systemctl restart docker >/dev/null 2>&1 \
-        && success "Docker restarted" \
-        || warn "Docker skip"
+    prompt_docker_restart
 
     verify_disable \
         && success "✓ Perfect!" \
@@ -132,9 +166,7 @@ else
     rm -f /etc/resolv.conf
     ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
-    systemctl restart docker >/dev/null 2>&1 \
-        && success "Docker restarted" \
-        || warn "Docker skip"
+    prompt_docker_restart
 
     success "✓ Undo complete"
 fi
