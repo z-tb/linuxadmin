@@ -1,4 +1,26 @@
 #!/usr/bin/env python3
+#
+# pass.py - Interactive GPG + pass(1) Password Manager
+#
+# Guided CLI wrapper around GnuPG and the standard Unix password manager
+# (pass). Walks the user through selecting or creating a GPG key, then
+# storing a password in the pass password store.
+#
+# Workflow:
+#   1. Checks that gpg and pass are installed.
+#   2. Lists existing GPG secret keys and lets the user pick one,
+#      or generates a new 4096-bit RSA key pair if none exist.
+#   3. Initializes ~/.password-store with the chosen key if needed.
+#   4. Prompts for a password name and value, confirms, and stores it
+#      via `pass insert`.
+#
+# Requirements:
+#   - gnupg (gpg)
+#   - pass  (https://www.passwordstore.org)
+#
+# Usage:
+#   python3 pass.py
+#
 import subprocess
 import sys
 import os
@@ -120,7 +142,8 @@ def check_gpg_key():
         print_color(Emojis.SUCCESS, f"{Colors.GREEN}GPG key(s) found!{Colors.NC}")
         return select_gpg_key(keys)
     else:
-        print_color(Emojis.WARNING, f"{Colors.YELLOW}No GPG key found.{Colors.NC}")
+        print_color(Emojis.WARNING, f"{Colors.YELLOW}No GPG key found. A GPG key is required to encrypt passwords in the password store.{Colors.NC}")
+        print_color(Emojis.INFO, f"{Colors.CYAN}Let's create one now.{Colors.NC}")
         return create_gpg_key()
 
 def select_gpg_key(keys):
@@ -189,7 +212,9 @@ Expire-Date: 0
             batch_file = f.name
         
         try:
+            print_color(Emojis.INFO, f"{Colors.CYAN}Generating key (this may take a minute while entropy is gathered)...{Colors.NC}")
             result = run_command(['gpg', '--batch', '--generate-key', batch_file])
+
             if result and result.returncode == 0:
                 # Get the newly created key ID
                 keys = get_gpg_keys()
@@ -236,20 +261,23 @@ def show_pass_list():
 def prompt_for_key_name(gpg_key_id):
     """Prompt for key name to store password"""
     print()
-    show_pass_list()
-    print()
-    
+
+    password_store_path = os.path.expanduser('~/.password-store')
+    if os.path.exists(password_store_path):
+        show_pass_list()
+        print()
+
     try:
-        key_name = input(f"{Emojis.KEY} {Colors.PURPLE}Enter a name for the secret to store (e.g., email, website): {Colors.NC}")
+        key_name = input(f"{Emojis.KEY} {Colors.PURPLE}Enter a name for the password to store (e.g., email, website): {Colors.NC}")
         
         if not key_name.strip():
-            print_color(Emojis.ERROR, f"{Colors.RED}Secret name cannot be empty!{Colors.NC}")
+            print_color(Emojis.ERROR, f"{Colors.RED}Password name cannot be empty!{Colors.NC}")
             return prompt_for_key_name(gpg_key_id)
         
         # Check if password already exists
         result = run_command(['pass', 'show', key_name])
         if result and result.returncode == 0:
-            print_color(Emojis.WARNING, f"{Colors.YELLOW}A secret named '{key_name}' already exists.{Colors.NC}")
+            print_color(Emojis.WARNING, f"{Colors.YELLOW}A password named '{key_name}' already exists.{Colors.NC}")
             overwrite = input(f"{Emojis.REFRESH} {Colors.YELLOW}Do you want to overwrite it? (y/N): {Colors.NC}")
             if overwrite.lower() in ['y', 'yes']:
                 return prompt_for_password(key_name, gpg_key_id)
@@ -265,8 +293,8 @@ def prompt_for_key_name(gpg_key_id):
 def prompt_for_password(key_name, gpg_key_id):
     """Prompt for password to store"""
     try:
-        password = getpass.getpass(f"{Emojis.LOCK} {Colors.BLUE}Secret to store for '{key_name}': {Colors.NC}")
-        password_confirm = getpass.getpass(f"{Emojis.LOCK} {Colors.BLUE}Enter the secret again: {Colors.NC}")
+        password = getpass.getpass(f"{Emojis.LOCK} {Colors.BLUE}Password to store for '{key_name}': {Colors.NC}")
+        password_confirm = getpass.getpass(f"{Emojis.LOCK} {Colors.BLUE}Enter the password again: {Colors.NC}")
         
         if password != password_confirm:
             print_color(Emojis.ERROR, f"{Colors.RED}Passwords do not match!{Colors.NC}")
