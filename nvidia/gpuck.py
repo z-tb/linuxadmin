@@ -82,18 +82,28 @@ class MetricBuffer:
     """
     Stores time-series metric data with optional maximum length.
     Used for smooth scrolling graphs in the GTK window.
+    Supports exponential moving average (EMA) smoothing.
     """
-    def __init__(self, maxlen=600):
+    def __init__(self, maxlen=600, ema_alpha=1.0):
         self.samples = collections.deque(maxlen=maxlen)  # Efficient FIFO buffer
+        self.ema_alpha = ema_alpha  # 1.0 = no smoothing, lower = smoother
+        self._ema_value = None
 
     def append(self, t, v):
         """
-        Add a new sample. If time is non-monotonic, increment slightly
-        to prevent issues in interpolation.
+        Add a new sample with optional EMA smoothing.
+        If time is non-monotonic, increment slightly to prevent issues.
         """
         if self.samples and t <= self.samples[-1][0]:
             t = self.samples[-1][0] + 1e-6
-        self.samples.append((t, float(v)))
+        v = float(v)
+        if not math.isnan(v):
+            if self._ema_value is None:
+                self._ema_value = v
+            else:
+                self._ema_value += self.ema_alpha * (v - self._ema_value)
+            v = self._ema_value
+        self.samples.append((t, v))
 
     def prune(self, cutoff):
         """Remove old samples older than cutoff time to limit memory usage."""
@@ -173,7 +183,7 @@ class GPUReader:
             "Gpu_Memory_%": mem_pct,
             "gpu_utilization_%": util,
             "gpu_watts": power,
-            "fan_%": fan,
+            "gpu_fan_%": fan,
         }
 
     def _read_nvidia_smi(self):
@@ -193,7 +203,7 @@ class GPUReader:
                 "Gpu_Memory_%": mem_pct,
                 "gpu_utilization_%": util,
                 "gpu_watts": pwr,
-                "fan_%": fan,
+                "gpu_fan_%": fan,
             }
         except Exception:
             return {}
@@ -252,25 +262,41 @@ class GPUWindow(Gtk.Window):
     Draws live graphs for GPU metrics, shows bottom status summary.
     Provides File, View, Help menus.
     """
-    def __init__(self, dots_mode=None):
+    def __init__(self, dots_mode=None, sample_interval=SAMPLE_INTERVAL, buffer_size=600, metric_visibility=None):
         super().__init__(title="gpuck")
         self.set_icon(get_embedded_icon_pixbuf())  # Set window icon
         self.set_default_size(1000, 600)  # Initial size
 
         self.dots_mode = set(dots_mode) if dots_mode else set()  # Metrics to plot as dots only
+        self.sample_interval = sample_interval  # Sampling interval in seconds
+        self.buffer_size = buffer_size  # Number of samples to keep
+
         self.gpu_reader = GPUReader()  # GPU reader instance
         self.cpu_reader = CPUReader()  # CPU reader instance
 
-        # Metric keys: GPU metrics + CPU metrics
-        self.metrics = {k: MetricBuffer() for k in
-                        ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "gpu_watts", "fan_%",
-                         "cpu_temp", "cpu_utilization_%"]}
+        # EMA alpha per metric: lower = smoother. CPU util is noisy, needs more smoothing.
+        ema_alphas = {
+            "gpu_temp": 0.5,
+            "Gpu_Memory_%": 0.5,
+            "gpu_utilization_%": 0.3,
+            "gpu_watts": 0.5,
+            "gpu_fan_%": 0.5,
+            "cpu_temp": 0.4,
+            "cpu_utilization_%": 0.2,
+        }
+
+        self.metrics = {k: MetricBuffer(maxlen=buffer_size, ema_alpha=ema_alphas.get(k, 0.5))
+                        for k in ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "gpu_watts", "gpu_fan_%",
+                                  "cpu_temp", "cpu_utilization_%"]}
 
         vbox = Gtk.VBox(spacing=6)
         self.add(vbox)
 
-        # All metrics visible by default
-        self.metric_visibility = {k: True for k in self.metrics}
+        # Metric visibility: use provided visibility or default to all visible
+        if metric_visibility is not None:
+            self.metric_visibility = metric_visibility
+        else:
+            self.metric_visibility = {k: True for k in self.metrics}
 
         # -------------------------------
         # Menubar setup
@@ -333,7 +359,7 @@ class GPUWindow(Gtk.Window):
         self.graph_areas = {}  # Map metric name to (x0, y0, x1, y1) coordinates
 
         # Setup periodic GPU sampling and drawing refresh
-        GLib.timeout_add(int(SAMPLE_INTERVAL * 1000), self.sample)
+        GLib.timeout_add(int(self.sample_interval * 1000), self.sample)
         GLib.timeout_add(int(1000 / RENDER_FPS), self.refresh)
         self.show_all()
 
@@ -414,7 +440,7 @@ class GPUWindow(Gtk.Window):
             "Gpu_Memory_%": (0.3, 0.7, 1.0),
             "gpu_utilization_%": (0.4, 1.0, 0.4),
             "gpu_watts": (1.0, 0.8, 0.2),
-            "fan_%": (0.8, 0.5, 1.0),
+            "gpu_fan_%": (0.8, 0.5, 1.0),
             "cpu_temp": (1.0, 0.6, 0.0),
             "cpu_utilization_%": (0.6, 0.8, 1.0),
         }
@@ -499,8 +525,9 @@ class GPUWindow(Gtk.Window):
 
         margin, rows = 8, len(keys)
         row_h = (h - (rows + 1) * margin) / rows
-        # Use wall-clock time for continuous smooth scrolling
+        # Snap render time to sample grid to prevent interpolation jitter
         now = time.time()
+        now = math.floor(now / self.sample_interval) * self.sample_interval
         start = now - WINDOW_SECONDS
 
         colors = {
@@ -508,7 +535,7 @@ class GPUWindow(Gtk.Window):
             "Gpu_Memory_%": (0.3, 0.7, 1.0),
             "gpu_utilization_%": (0.4, 1.0, 0.4),
             "gpu_watts": (1.0, 0.8, 0.2),
-            "fan_%": (0.8, 0.5, 1.0),
+            "gpu_fan_%": (0.8, 0.5, 1.0),
             "cpu_temp": (1.0, 0.6, 0.0),       # Orange for CPU temp
             "cpu_utilization_%": (0.6, 0.8, 1.0),  # Light blue for CPU util
         }
@@ -574,8 +601,9 @@ class GPUWindow(Gtk.Window):
                         continue
 
                     v = max(ymin, min(ymax, v))
-                    # Keep Y as float - let Cairo handle the rendering smoothly
+                    # Snap Y to nearest half-pixel to prevent anti-aliasing shimmer
                     y = plot_y1 - (v - ymin) / (ymax - ymin) * (plot_y1 - plot_y0)
+                    y = round(y * 2) / 2
 
                     if first_point:
                         cr.move_to(px, y)
@@ -626,13 +654,25 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                    # Show all metrics as lines
-  %(prog)s --dots gpu_temp                   # Show gpu_temp as dots only
-  %(prog)s --dots gpu_temp gpu_utilization_% # Show both as dots
+  %(prog)s                                      # Show all metrics as lines
+  %(prog)s --dots gpu_temp                     # Show gpu_temp as dots only
+  %(prog)s --dots gpu_temp gpu_utilization_%% # Show both as dots
         """
     )
     parser.add_argument("--dots", nargs="*", default=None,
                         help="Metrics to plot as dots only (space-separated). If --dots is specified with no metrics, all metrics will be dots.")
+    parser.add_argument("--stime", type=float, default=SAMPLE_INTERVAL,
+                        metavar="SECONDS",
+                        help=f"Sample time between readings in seconds (default: {SAMPLE_INTERVAL})")
+    parser.add_argument("--buffer-size", type=int, default=600,
+                        metavar="SAMPLES",
+                        help="Number of samples to keep in history buffer (default: 600)")
+    parser.add_argument("--metrics", nargs="+", default=None,
+                        metavar="METRIC",
+                        help="""Display only specified metrics (space-separated). Available metrics:
+                        gtemp (GPU Temp), gmem (GPU Memory), gutil (GPU Utilization),
+                        gwatt (GPU Watts), gfan (GPU Fan), ctemp (CPU Temp), cutil (CPU Utilization).
+                        Example: --metrics gtemp gutil gmem""")
     args = parser.parse_args()
 
     # Handle --dots argument
@@ -640,11 +680,35 @@ Examples:
     if args.dots is not None:
         if len(args.dots) == 0:
             # --dots with no arguments means all metrics as dots
-            dots_mode = ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "Power_watts", "fan_%"]
+            dots_mode = ["gpu_temp", "Gpu_Memory_%", "gpu_utilization_%", "gpu_watts", "gpu_fan_%",
+                         "cpu_temp", "cpu_utilization_%"]
         else:
             dots_mode = args.dots
 
-    win = GPUWindow(dots_mode=dots_mode)
+    # Build metric visibility filter from --metrics argument
+    metric_visibility = None
+    if args.metrics:
+        # Map shorthand names to full metric names
+        metric_map = {
+            "gtemp": "gpu_temp",
+            "gmem": "Gpu_Memory_%",
+            "gutil": "gpu_utilization_%",
+            "gwatt": "gpu_watts",
+            "gfan": "gpu_fan_%",
+            "ctemp": "cpu_temp",
+            "cutil": "cpu_utilization_%"
+        }
+        metric_visibility = {}
+        for metric_key in metric_map.values():
+            metric_visibility[metric_key] = False
+        for shorthand in args.metrics:
+            if shorthand in metric_map:
+                metric_visibility[metric_map[shorthand]] = True
+            else:
+                print(f"Warning: Unknown metric '{shorthand}'. Use --help for available metrics.")
+
+    win = GPUWindow(dots_mode=dots_mode, sample_interval=args.stime,
+                    buffer_size=args.buffer_size, metric_visibility=metric_visibility)
     win.connect("destroy", Gtk.main_quit)
     Gtk.main()
 
