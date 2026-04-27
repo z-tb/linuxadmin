@@ -14,35 +14,39 @@ PURPOSE:
 REQUIREMENTS:
     - Root/sudo privileges (modifies system driver bindings)
     - xhci_hcd driver loaded and available
-    - Python 3.6+ with standard libraries
 
 FUNCTIONALITY:
     1. Scans for all PCI devices bound to the xhci_hcd driver
-    2. Safely unbinds each device from the driver
-    3. Immediately rebinds the device to restore functionality
-    4. Provides colorful progress feedback and error reporting
-    5. Displays detailed summary of operations
+    2. Walks sysfs device ancestry to detect any mounted filesystems
+       that depend on target USB controllers (catches partitions,
+       dm/luks/lvm layers, and hub-attached devices)
+    3. Prompts to unmount affected filesystems before proceeding
+    4. Refuses to rebind if mounted filesystems cannot be unmounted
+    5. Safely unbinds each device from the driver
+    6. Immediately rebinds the device to restore functionality
 
 SAFETY FEATURES:
     - Validates root access before proceeding
     - Checks for driver availability
+    - Detects mounted filesystems via sysfs PCI device ancestry
+      (not lsblk TRAN field, which misses hub/dm/luks devices)
+    - Hard-blocks rebind if any affected filesystem remains mounted
+    - Syncs filesystem caches before unmount
     - Handles interrupts gracefully (Ctrl+C)
     - Short delay between unbind/rebind for system stability
-    - Detailed error reporting for troubleshooting
 
 USAGE:
-    sudo python3 usb-replug.py
-
-OUTPUT:
-    - Super fancy terminal output
-    - Device identification with human-readable names
-    - Success/failure status for each operation
-    - Final summary with statistics
+    sudo ./usb-replug.sh
 
 TECHNICAL NOTES:
     - Operates on /sys/bus/pci/drivers/xhci_hcd/ sysfs interface
     - Uses lspci for device name resolution
     - PCI device format: XXXX:XX:XX.X (domain:bus:device.function)
+    - Unbinding a PCI xHCI controller triggers the kernel call chain:
+      unbind_store() -> device_driver_detach() -> xhci remove ->
+      usb_stor_disconnect() -> quiesce_and_remove_host() ->
+      scsi_remove_host() -> del_gendisk() which destroys the block
+      device. Any mounted filesystem becomes a zombie (invalid bdev).
     - Colors may not display properly on all terminal emulators
 
 ===============================================================================
@@ -120,79 +124,137 @@ animate_progress() {
     printf "] "
 }
 
-# Function to check for mounted USB filesystems
-check_usb_mounts() {
-    local usb_mounts
-    usb_mounts=$(lsblk -o NAME,TRAN,MOUNTPOINT -nr 2>/dev/null | awk '$2=="usb" && $3!=""')
-    
-    if [[ -z "$usb_mounts" ]]; then
-        print_status $GREEN "✅ No mounted USB filesystems detected"
+# Walk sysfs to check if a block device sits on a given PCI device.
+# Returns 0 (true) if the block device is a child of the PCI device.
+# This catches partitions, dm/lvm/luks layers, and hub-attached devices
+# by resolving through /sys/block and /sys/dev/block to the physical
+# device path, then walking parent directories for a PCI ID match.
+block_dev_on_pci() {
+    local blkdev="$1"   # e.g. sda1, dm-0
+    local pci_id="$2"   # e.g. 0000:00:14.0
+
+    # Resolve the sysfs path for this block device
+    local syspath=""
+
+    # Try /sys/block/<dev> first (whole disks)
+    if [[ -d "/sys/block/$blkdev" ]]; then
+        syspath=$(readlink -f "/sys/block/$blkdev")
+    # Try /sys/block/<parent>/<dev> (partitions like sda1)
+    elif [[ -d "/sys/block/${blkdev%%[0-9]*}/$blkdev" ]]; then
+        syspath=$(readlink -f "/sys/block/${blkdev%%[0-9]*}/$blkdev")
+    fi
+
+    # For dm/mapper devices, resolve the slave chain to find the
+    # underlying physical device
+    if [[ "$blkdev" == dm-* ]] && [[ -d "/sys/block/$blkdev/slaves" ]]; then
+        for slave in /sys/block/"$blkdev"/slaves/*; do
+            local slave_name=$(basename "$slave")
+            if block_dev_on_pci "$slave_name" "$pci_id"; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+
+    if [[ -z "$syspath" ]]; then
+        return 1
+    fi
+
+    # Walk the sysfs path upward looking for the PCI device ID
+    if [[ "$syspath" == *"$pci_id"* ]]; then
         return 0
     fi
-    
-    print_status $RED "⚠️  WARNING: Mounted USB filesystems detected!"
-    print_status $RED "   Rebinding USB controllers will disconnect these devices."
-    print_status $RED "   Data loss or corruption may occur on mounted filesystems."
+
+    return 1
+}
+
+# Find all mounted filesystems that depend on xHCI controllers we are
+# about to rebind. Uses sysfs device ancestry instead of lsblk TRAN
+# field, which misses hub-attached devices and dm/luks/lvm layers.
+#
+# Populates two parallel arrays:
+#   AFFECTED_DEVS[i]   - block device name (e.g. sda1)
+#   AFFECTED_MNTS[i]   - mount point path
+check_usb_mounts() {
+    local -a pci_devices=("$@")
+
+    AFFECTED_DEVS=()
+    AFFECTED_MNTS=()
+
+    # Read all mounts from /proc/mounts (more reliable than lsblk for
+    # detecting dm/luks/lvm mounts)
+    while read -r src mnt fstype rest; do
+        # Skip non-device mounts (proc, sysfs, tmpfs, etc.)
+        [[ "$src" != /dev/* ]] && continue
+
+        # Strip /dev/ prefix and resolve dm-mapper symlinks
+        local devname="${src#/dev/}"
+        if [[ "$devname" == mapper/* ]]; then
+            local resolved=$(readlink -f "$src" 2>/dev/null)
+            [[ -z "$resolved" ]] && continue
+            devname="${resolved#/dev/}"
+        fi
+
+        # Check if this block device sits on any of our target controllers
+        for pci_id in "${pci_devices[@]}"; do
+            if block_dev_on_pci "$devname" "$pci_id"; then
+                AFFECTED_DEVS+=("$src")
+                AFFECTED_MNTS+=("$mnt")
+                break
+            fi
+        done
+    done < /proc/mounts
+
+    if [[ ${#AFFECTED_DEVS[@]} -eq 0 ]]; then
+        print_status $GREEN "✅ No mounted filesystems on target USB controllers"
+        return 0
+    fi
+
+    # Prompt per-mount: unmount or cancel
+    print_status $RED "⚠️  WARNING: Mounted filesystems detected on USB controllers"
+    print_status $RED "   Rebinding will destroy these block devices in-kernel."
+    print_status $RED "   Mounted filesystems WILL become unusable (zombie bdev)."
     echo
-    print_status $YELLOW "   Mounted USB devices:"
-    while IFS= read -r line; do
-        local dev=$(echo "$line" | awk '{print $1}')
-        local mnt=$(echo "$line" | awk '{print $3}')
-        print_status $WHITE "     /dev/$dev $ARROW $mnt"
-    done <<< "$usb_mounts"
-    echo
-    
-    while true; do
-        print_status $CYAN "   Options:"
-        print_status $WHITE "     [s] Stop - abort script"
-        print_status $WHITE "     [c] Continue - rebind anyway (risk data loss)"
-        print_status $WHITE "     [u] Unmount first - unmount all USB filesystems, then continue"
-        echo
-        printf "${CYAN}   Choose [s/c/u]: ${NC}"
+
+    local unmount_failed=0
+    for i in "${!AFFECTED_DEVS[@]}"; do
+        local dev="${AFFECTED_DEVS[$i]}"
+        local mnt="${AFFECTED_MNTS[$i]}"
+
+        printf "${WHITE}${dev} is mounted on ${mnt}${NC}\n"
+        printf "${CYAN}Select Y to unmount or N to cancel [Y|N]: ${NC}"
         read -r choice
-        
+
         case "$choice" in
-            s|S)
+            y|Y)
+                printf "${YELLOW}  ${ARROW} Syncing filesystem... ${NC}"
+                sync
+                print_status $GREEN "${CHECKMARK}"
+                printf "${YELLOW}  ${ARROW} Unmounting ${mnt}... ${NC}"
+                if umount "$mnt" 2>/dev/null; then
+                    print_status $GREEN "${CHECKMARK} Done"
+                else
+                    print_status $RED "${CROSS} Failed - device may be busy"
+                    print_status $YELLOW "    Tip: check open files with: lsof ${mnt}"
+                    unmount_failed=1
+                fi
+                ;;
+            *)
                 print_status $BLUE "ℹ️  Aborted by user"
                 exit 0
                 ;;
-            c|C)
-                print_status $YELLOW "⚠️  Continuing with mounted USB filesystems..."
-                return 0
-                ;;
-            u|U)
-                print_status $BLUE "ℹ️  Unmounting USB filesystems..."
-                local unmount_failed=0
-                while IFS= read -r line; do
-                    local mnt=$(echo "$line" | awk '{print $3}')
-                    printf "${YELLOW}  ${ARROW} Unmounting $mnt... ${NC}"
-                    if umount "$mnt" 2>/dev/null; then
-                        print_status $GREEN "${CHECKMARK} Done"
-                    else
-                        print_status $RED "${CROSS} Failed (device may be busy)"
-                        unmount_failed=1
-                    fi
-                done <<< "$usb_mounts"
-                
-                if [[ $unmount_failed -eq 1 ]]; then
-                    print_status $RED "⚠️  Some unmounts failed. Check for open files (lsof)."
-                    printf "${CYAN}   Continue anyway? [y/N]: ${NC}"
-                    read -r yn
-                    if [[ ! "$yn" =~ ^[Yy]$ ]]; then
-                        print_status $BLUE "ℹ️  Aborted by user"
-                        exit 0
-                    fi
-                else
-                    print_status $GREEN "✅ All USB filesystems unmounted"
-                fi
-                echo
-                return 0
-                ;;
-            *)
-                print_status $RED "   Invalid choice. Enter s, c, or u."
-                ;;
         esac
+        echo
     done
+
+    if [[ $unmount_failed -eq 1 ]]; then
+        print_status $RED "❌ Some filesystems could not be unmounted."
+        print_status $RED "   Cannot safely rebind controllers. Aborting."
+        exit 1
+    fi
+
+    print_status $GREEN "✅ All affected filesystems unmounted"
+    return 0
 }
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -290,8 +352,9 @@ main() {
     
     print_status $GREEN "✅ System checks passed"
     
-    # Check for mounted USB filesystems before proceeding
-    check_usb_mounts
+    # Check for mounted filesystems on target xHCI controllers.
+    # Pass the full PCI device list so sysfs ancestry can be checked.
+    check_usb_mounts "${devices[@]}"
     
     print_status $BLUE "📊 Found ${#devices[@]} xHCI USB device(s) to rebind"
     echo
