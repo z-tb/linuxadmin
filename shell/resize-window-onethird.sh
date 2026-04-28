@@ -7,7 +7,8 @@
 #
 # Positioning:
 #   - Partial widths stay centered on the window's current titlebar center.
-#   - Full width pins to monitor edges with margins.
+#   - When cycling from full back to 1/3, the window's pre-fullscreen
+#     X position is restored from saved state.
 #   - If resizing would push the window off-screen, it is clamped to
 #     stay within monitor bounds.
 #   - Height is always top-anchored with Y margin and taskbar offset.
@@ -59,19 +60,20 @@ done < <(xrandr --query)
 : "${MW:?monitor width not found}"
 : "${MH:?monitor height not found}"
 
-# read current step and advance (first run starts at step 0)
+# read current step and saved X position (first run starts at step 0)
+# state file format: "STEP SAVED_CENTER_X"
 mkdir -p "$STATE_DIR"
 STATE_FILE="$STATE_DIR/$WM_CLASS"
 STEP=0
+SAVED_CX=""
 if [[ -f "$STATE_FILE" ]]; then
-    STEP="$(cat "$STATE_FILE")"
-    # validate
+    read -r STEP SAVED_CX < "$STATE_FILE" || true
     if ! [[ "$STEP" =~ ^[0-9]+$ ]]; then
         STEP=0
+        SAVED_CX=""
     fi
     STEP=$(( (STEP + 1) % 4 ))
 fi
-printf '%d' "$STEP" > "$STATE_FILE"
 
 # compute width: full uses monitor width, others use fraction
 NUM="${DIVISORS[$STEP]}"
@@ -90,10 +92,21 @@ NEW_H=$(( MH - 2 * Y_MARGIN - TASKBAR_OFFSET ))
 (( NEW_H < 100 )) && NEW_H=100
 
 # X position: full width pins to margin, partial stays centered on titlebar
+# When leaving full-width, restore the saved center X
 if (( DEN == 1 )); then
+    # entering full - save current center X for later restoration
+    printf '%d %d' "$STEP" "$CENTER_X" > "$STATE_FILE"
     NEW_X=$(( MX + X_MARGIN ))
 else
-    NEW_X=$(( CENTER_X - NEW_W / 2 ))
+    # use saved center X if coming from full-width, otherwise use live center
+    if [[ -n "$SAVED_CX" ]] && [[ "$SAVED_CX" =~ ^[0-9]+$ ]]; then
+        NEW_X=$(( SAVED_CX - NEW_W / 2 ))
+        # clear saved X after restoring
+        printf '%d' "$STEP" > "$STATE_FILE"
+    else
+        printf '%d' "$STEP" > "$STATE_FILE"
+        NEW_X=$(( CENTER_X - NEW_W / 2 ))
+    fi
 fi
 NEW_Y=$(( MY + Y_MARGIN ))
 
