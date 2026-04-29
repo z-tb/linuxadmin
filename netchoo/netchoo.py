@@ -274,15 +274,21 @@ class NetworkMonitor(Gtk.Window):
         self.set_title("Netchoo")
         self.set_default_size(600, 400)
         self.set_border_width(10)
+        self.ROW_HEIGHT = 100  # approximate height per interface row
+        self.CHROME_HEIGHT = 80  # title, legend, padding
         
         # Create main container
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.add(main_box)
         
-        # Title
+        # Title (clickable for About dialog)
         title_label = Gtk.Label()
         title_label.set_markup("Netchoo Traffic Monitor")
-        main_box.pack_start(title_label, False, False, 0)
+        title_event = Gtk.EventBox()
+        title_event.add(title_label)
+        title_event.connect('button-press-event', self.on_title_clicked)
+        title_event.set_tooltip_text("Click for About")
+        main_box.pack_start(title_event, False, False, 0)
         
         # Legend
         legend_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
@@ -296,11 +302,11 @@ class NetworkMonitor(Gtk.Window):
         tx_label.set_markup('<span foreground="red">■ TX (Egress)</span>')
         legend_box.pack_start(tx_label, False, False, 0)
         
-        # Add note about Docker bridge color reversal
-        if REVERSE_DOCKER_BRIDGE_COLORS is True:
-            docker_note = Gtk.Label()
-            docker_note.set_markup('<span foreground="yellow">Docker bridge traffic colors are reversed from system perspective</span>')
-            legend_box.pack_start(docker_note, False, False, 0)
+        # Docker bridge color reversal toggle
+        self.docker_check = Gtk.CheckButton(label="Reverse Docker bridge colors")
+        self.docker_check.set_active(REVERSE_DOCKER_BRIDGE_COLORS)
+        self.docker_check.connect('toggled', self.on_docker_reverse_toggled)
+        legend_box.pack_start(self.docker_check, False, False, 0)
         
         # Scrolled window for interfaces
         scrolled = Gtk.ScrolledWindow()
@@ -322,9 +328,58 @@ class NetworkMonitor(Gtk.Window):
         self.connect('destroy', Gtk.main_quit)
     
     
+    def on_docker_reverse_toggled(self, widget):
+        """Handle Docker bridge color reversal toggle"""
+        global REVERSE_DOCKER_BRIDGE_COLORS
+        REVERSE_DOCKER_BRIDGE_COLORS = widget.get_active()
+        # Update tooltips on all docker bridge graphs
+        for interface, components in self.graphs.items():
+            graph = components['graph']
+            if graph.is_docker_bridge:
+                graph.set_tooltip_text(self.get_docker_tooltip())
+        # Force redraw of all graphs
+        for components in self.graphs.values():
+            components['graph'].queue_draw()
+    
+    def on_title_clicked(self, widget, event):
+        """Show About dialog"""
+        about = Gtk.AboutDialog(transient_for=self, modal=True)
+        about.set_program_name("Netchoo")
+        about.set_version("1.0")
+        about.set_comments(
+            "\U0001f443 Achoo!\n\n"
+            "A network bandwidth monitor/sniffer.\n"
+            "Real-time per-interface RX/TX monitoring via /proc/net/dev."
+        )
+        about.set_license_type(Gtk.License.GPL_3_0)
+        about.set_website("https://github.com/z-tb/linuxadmin")
+        about.set_website_label("GitHub")
+        about.set_authors(["z-tb"])
+        about.run()
+        about.destroy()
+    
+    @staticmethod
+    def get_docker_tooltip():
+        """Return tooltip text for Docker bridge interfaces"""
+        if REVERSE_DOCKER_BRIDGE_COLORS:
+            return (
+                "Docker bridge - container perspective.\n"
+                "RX (green) = containers receiving\n"
+                "TX (red) = containers sending\n"
+                "Uncheck 'Reverse Docker bridge colors' for host perspective."
+            )
+        else:
+            return (
+                "Docker bridge - host perspective.\n"
+                "RX (green) = traffic from containers into host\n"
+                "TX (red) = traffic from host to containers\n"
+                "Check 'Reverse Docker bridge colors' for container perspective."
+            )
+    
     def update_interfaces(self):
         """Update the list of active interfaces"""
         active_interfaces = self.net_stats.get_active_interfaces()
+        prev_count = len(self.graphs)
         
         # Add new interfaces
         for interface in active_interfaces:
@@ -335,39 +390,57 @@ class NetworkMonitor(Gtk.Window):
         for interface in list(self.graphs.keys()):
             if interface not in active_interfaces:
                 self.remove_interface_row(interface)
+        
+        # Resize window if interface count changed
+        if len(self.graphs) != prev_count:
+            self.resize_to_fit()
+    
+    def resize_to_fit(self):
+        """Resize window height to fit all interface rows"""
+        n = max(len(self.graphs), 1)
+        target_height = self.CHROME_HEIGHT + n * self.ROW_HEIGHT
+        screen = self.get_screen()
+        max_height = int(screen.get_height() * 0.85)
+        self.resize(self.get_size()[0], min(target_height, max_height))
 
     @staticmethod
-    def get_interface_emoji(interface):
+    def get_interface_icon_name(interface):
+        """Return a GTK icon name for the interface type"""
         name = interface.lower()
         if name.startswith(('veth', 'virbr')):
-            return "🧬"  # Virtual
-        elif name.startswith(('docker')):
-            return "🐳"  # Docker
-        elif name.startswith(('w', 'w')):
-            return "🛜"  # Wi-Fi
+            return "computer"
+        elif name.startswith(('docker',)):
+            return "preferences-system-network"
+        elif name.startswith(('wl', 'wlan', 'wifi')):
+            return "network-wireless"
         elif name.startswith(('eth', 'en')):
-            return "🖧"  # Wired
+            return "network-wired"
         elif name.startswith(('br',)):
-            return "🌉"  # Bridge
+            return "network-workgroup"
         elif name.startswith(('tun', 'tap', 'wg', 'gpd')):
-            return "🔒"  # VPN/Tunnel
+            return "network-vpn"
         else:
-            return "❓"
+            return "network-idle"
     
     def add_interface_row(self, interface):
         """Add a new interface row"""
         row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         row_box.set_border_width(5)
         
+        # Interface type icon
+        icon_name = self.get_interface_icon_name(interface)
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.LARGE_TOOLBAR)
+        row_box.pack_start(icon, False, False, 0)
+        
         # Truncate interface name if too long
-        emoji = self.get_interface_emoji(interface)
-        display_name = f"{emoji} {interface}"
+        display_name = interface
         if len(display_name) > MAX_INTERFACE_CHARS:
             display_name = display_name[:MAX_INTERFACE_CHARS-3] + "..."
         
         # Interface name label with fixed width
         name_label = Gtk.Label()
-        name_label.set_markup(f'<span foreground="#00FFFF" font_desc="monospace bold 10">{GLib.markup_escape_text(display_name)}</span>')
+        escaped_name = GLib.markup_escape_text(display_name)
+        name_label.set_markup(f'<span foreground="#00FFFF" font_desc="monospace bold 10">{escaped_name}</span>')
         
         name_label.set_size_request(MAX_INTERFACE_CHARS * 8, -1)  # Approximate width calculation
         name_label.set_halign(Gtk.Align.START)
@@ -378,6 +451,8 @@ class NetworkMonitor(Gtk.Window):
         # Traffic graph - expandable width
         graph = TrafficGraph(interface)
         graph.set_size_request(400, 80)  # Minimum width
+        if graph.is_docker_bridge:
+            graph.set_tooltip_text(self.get_docker_tooltip())
         row_box.pack_start(graph, True, True, 0)
         
         # Add separator
@@ -468,7 +543,7 @@ Examples:
     parser.add_argument(
         '-v', '--version',
         action='version',
-        version='Network Traffic Monitor 1.0'
+        version='Netchoo 1.0'
     )
     
     return parser.parse_args()
