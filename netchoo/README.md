@@ -14,15 +14,23 @@ Here we can see Netchoo in action as it downloads a tarball from kernel.org, the
 ## Features
 
 * Real-time monitoring of network interfaces
-* Visual graphs showing RX/TX rates
-* Bandwidth format display
-* Stretchy window
+* Visual graphs showing RX/TX rates with auto-scaling
+* Per-interface type icons (wired, wireless, VPN, Docker, bridge, virtual)
+* Packet capture - click an interface name to open a live capture window (requires sudo)
+* Remote hosts tab - tracks unique remote IPs, hostnames (reverse DNS), connection counts, and packet counts
+* Egress traffic colored green, ingress colored red in capture views
+* Docker bridge color reversal toggle for host vs container perspective
+* Docker bridge tooltip explaining traffic direction
+* About dialog (click the title)
+* Auto-sizing window to fit displayed interfaces
+* Stretchy/resizable window
 
 ## Requirements
 
 * Python 3.x
 * GTK3+
 * PyGObject
+* scapy (for packet capture)
 * Linux system with procfs support
 
 ## Installation
@@ -44,16 +52,23 @@ python3 netchoo.py
 ## Usage
 
 The application provides a graphical interface displaying:
-* Active network interfaces
+* Active network interfaces with type icons
 * Real-time RX/TX traffic graphs
 * Current bandwidth usage
+
+Click an interface name to open a packet capture window (requires sudo):
+```bash
+sudo python3 netchoo.py
+```
 
 ## Technical Details
 
 * Monitors network interfaces through `/proc/net/dev`
 * Updates traffic data every second (configurable via -s)
 * 5-minute rolling history window (configurable via -t)
-* Stretchy graph scaling
+* Packet capture via scapy with subnet-aware direction detection
+* Async DNS resolution for remote host lookups
+* Auto-scaling graphs
 
 ## License
 

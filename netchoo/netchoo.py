@@ -680,7 +680,6 @@ class NetworkMonitor(Gtk.Window):
         about.set_program_name("Netchoo")
         about.set_version("1.0")
         about.set_comments(
-            "\U0001f443 Achoo!\n\n"
             "A network bandwidth monitor/sniffer.\n"
             "Real-time per-interface RX/TX monitoring via /proc/net/dev."
         )
