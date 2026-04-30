@@ -1,8 +1,13 @@
 # Netchoo
 
-A real-time network traffic monitoring application written using Python, GTK3 and Claude✨ (mostly Claude), providing visual representation of network interface activity. 
+| In Use | Still Fixing |
+|--------|--------------|
+| ✅     |             |
+
+A real-time network traffic monitoring application written using Python, GTK3 and Claude (mostly Claude), providing visual representation of network interface activity. Reads `/proc/net/dev` to graph per-interface RX/TX rates in a scrolling window.
 
 Here we can see Netchoo in action as it downloads a tarball from kernel.org, then uploads it to an s3 bucket for no other reason than to generate a nice graph.
+
 
 ![Netchoo in action](images/shot2.png)
 
@@ -28,8 +33,9 @@ git clone https://github.com/z-tb/linuxadmin.git
 ```
 2. Install dependencies:
 ```bash
-sudo apt-get install python3-gi gir1.2-gtk-3.0
+sudo apt-get install python3-gi gir1.2-gtk-3.0 adwaita-icon-theme python3-scapy
 ```
+Note: `adwaita-icon-theme` (or equivalent) provides the interface type icons. Most desktop Linux installs include this already. `python3-scapy` is required for the packet capture feature (click an interface name to capture). Capture requires running netchoo with sudo.
 3. Run the application:
 ```bash
 python3 netchoo.py
