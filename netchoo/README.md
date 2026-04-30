@@ -35,7 +35,7 @@ git clone https://github.com/z-tb/linuxadmin.git
 ```bash
 sudo apt-get install python3-gi gir1.2-gtk-3.0 adwaita-icon-theme python3-scapy
 ```
-Note: `adwaita-icon-theme` (or equivalent) provides the interface type icons. Most desktop Linux installs include this already. `python3-scapy` is required for the packet capture feature (click an interface name to capture). Capture requires running netchoo with sudo.
+Note: `adwaita-icon-theme` (or equivalent) provides the interface type icons. Most desktop Linux installs include this already. `python3-scapy` is required for the packet capture feature (click an interface name to capture). Capture requires running netchoo with sudo. Scapy's optional matplotlib dependency is suppressed at runtime to avoid numpy version conflicts.
 3. Run the application:
 ```bash
 python3 netchoo.py

@@ -5,7 +5,11 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk
 import cairo
 import os
+# Suppress matplotlib import - scapy pulls it in for optional plotting
+# but it can crash with numpy version mismatches. We don't need it.
 import sys
+sys.modules.setdefault('matplotlib', None)
+sys.modules.setdefault('matplotlib.pyplot', None)
 import time
 import argparse
 from collections import defaultdict, deque
@@ -14,6 +18,7 @@ import queue
 import subprocess
 import re
 import socket
+import ipaddress
 
 # Global configuration (will be set from command line arguments)
 MAX_INTERFACE_CHARS = 20
@@ -283,10 +288,10 @@ class CaptureWindow(Gtk.Window):
     
     PROTO_MAP = {1: "ICMP", 6: "TCP", 17: "UDP"}
     
-    def __init__(self, interface, local_ips, parent):
+    def __init__(self, interface, local_networks, parent):
         super().__init__()
         self.interface = interface
-        self.local_ips = set(local_ips)
+        self.local_networks = local_networks  # list of ip_network objects
         self.parent = parent
         self.sniffer = None
         self.running = False
@@ -459,9 +464,16 @@ class CaptureWindow(Gtk.Window):
                 info_parts.append(f"[{flags}]")
             info = " ".join(info_parts)
             
-            # Direction detection
-            is_egress = src_ip in self.local_ips
-            is_ingress = dst_ip in self.local_ips
+            # Direction detection using subnet matching
+            try:
+                src_addr = ipaddress.ip_address(src_ip) if src_ip else None
+                dst_addr = ipaddress.ip_address(dst_ip) if dst_ip else None
+            except ValueError:
+                src_addr = None
+                dst_addr = None
+            
+            is_egress = src_addr and any(src_addr in net for net in self.local_networks)
+            is_ingress = dst_addr and any(dst_addr in net for net in self.local_networks)
             
             if is_egress and not is_ingress:
                 bg = "#1a3a1a"  # dark green
@@ -703,30 +715,33 @@ class NetworkMonitor(Gtk.Window):
             dialog.destroy()
             return
         
-        # Get local IPs for direction detection
-        local_ips = self._get_local_ips(interface)
+        # Get local networks for direction detection
+        local_networks = self._get_local_networks(interface)
         
         # Open capture window
-        win = CaptureWindow(interface, local_ips, self)
+        win = CaptureWindow(interface, local_networks, self)
         self.capture_windows[interface] = win
     
     @staticmethod
-    def _get_local_ips(interface):
-        """Get local IP addresses for an interface"""
-        ips = []
+    def _get_local_networks(interface):
+        """Get local IP networks for an interface as ip_network objects"""
+        networks = []
         try:
             output = subprocess.check_output(
                 ['ip', '-o', 'addr', 'show', interface],
                 universal_newlines=True
             )
             for line in output.strip().split('\n'):
-                # Extract IP from "inet 10.0.0.1/24" or "inet6 fe80::1/64"
-                match = re.search(r'inet6?\s+([^\s/]+)', line)
+                # Extract "10.0.0.1/24" or "fe80::1/64"
+                match = re.search(r'inet6?\s+(\S+)', line)
                 if match:
-                    ips.append(match.group(1))
+                    try:
+                        networks.append(ipaddress.ip_network(match.group(1), strict=False))
+                    except ValueError:
+                        pass
         except Exception:
             pass
-        return ips
+        return networks
     
     @staticmethod
     def get_docker_tooltip():

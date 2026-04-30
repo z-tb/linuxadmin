@@ -1,0 +1,385 @@
+#!/bin/bash
+# wireguard-manager.sh - WireGuard Management Tool
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# UTF-8 Icons
+ICON_ROCKET="🚀"
+ICON_STOP="🛑"
+ICON_INFO="ℹ️ "
+ICON_LIST="📋"
+ICON_PING="📡"
+ICON_STATS="📊"
+ICON_CHECK="✓"
+ICON_CROSS="✗"
+ICON_ARROW="➜"
+ICON_NETWORK="🌐"
+ICON_KEY="🔑"
+ICON_CLOCK="🕐"
+ICON_TRANSFER="📤"
+ICON_RECEIVE="📥"
+
+# WireGuard interface
+WG_INTERFACE="wg0"
+
+# Check if running as root
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}${ICON_CROSS} Please run as root or with sudo${NC}"
+        exit 1
+    fi
+}
+
+# Detect init system
+detect_init() {
+    if [ -d /run/systemd/system ]; then
+        echo "systemd"
+    else
+        echo "other"
+    fi
+}
+
+# Header
+show_header() {
+    clear
+    echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${BOLD}${WHITE}          WireGuard Management Tool                         ${NC}${CYAN}║${NC}"
+    echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# Start WireGuard
+start_wireguard() {
+    echo -e "${YELLOW}${ICON_ROCKET} Starting WireGuard interface ${WG_INTERFACE}...${NC}"
+    
+    INIT_SYSTEM=$(detect_init)
+    
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl start wg-quick@${WG_INTERFACE}
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}${ICON_CHECK} WireGuard started successfully${NC}"
+        else
+            echo -e "${RED}${ICON_CROSS} Failed to start WireGuard${NC}"
+        fi
+    else
+        wg-quick up ${WG_INTERFACE}
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}${ICON_CHECK} WireGuard started successfully${NC}"
+        else
+            echo -e "${RED}${ICON_CROSS} Failed to start WireGuard${NC}"
+        fi
+    fi
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Stop WireGuard
+stop_wireguard() {
+    echo -e "${YELLOW}${ICON_STOP} Stopping WireGuard interface ${WG_INTERFACE}...${NC}"
+    
+    INIT_SYSTEM=$(detect_init)
+    
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop wg-quick@${WG_INTERFACE}
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}${ICON_CHECK} WireGuard stopped successfully${NC}"
+        else
+            echo -e "${RED}${ICON_CROSS} Failed to stop WireGuard${NC}"
+        fi
+    else
+        wg-quick down ${WG_INTERFACE}
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}${ICON_CHECK} WireGuard stopped successfully${NC}"
+        else
+            echo -e "${RED}${ICON_CROSS} Failed to stop WireGuard${NC}"
+        fi
+    fi
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Show WireGuard status
+show_status() {
+    echo -e "${CYAN}${ICON_INFO} WireGuard Status for ${WG_INTERFACE}${NC}"
+    echo -e "${GRAY}════════════════════════════════════════════════════${NC}"
+    
+    if ! ip link show ${WG_INTERFACE} &>/dev/null; then
+        echo -e "${RED}${ICON_CROSS} Interface ${WG_INTERFACE} is not active${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    echo ""
+    wg show ${WG_INTERFACE}
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# List peers
+list_peers() {
+    echo -e "${MAGENTA}${ICON_LIST} WireGuard Peers${NC}"
+    echo -e "${GRAY}════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if ! ip link show ${WG_INTERFACE} &>/dev/null; then
+        echo -e "${RED}${ICON_CROSS} Interface ${WG_INTERFACE} is not active${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    # Get peer information
+    PEERS=$(wg show ${WG_INTERFACE} peers 2>/dev/null)
+    
+    if [ -z "$PEERS" ]; then
+        echo -e "${YELLOW}${ICON_INFO} No peers configured${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    PEER_COUNT=0
+    while IFS= read -r peer; do
+        ((PEER_COUNT++))
+        echo -e "${BOLD}${WHITE}Peer #${PEER_COUNT}:${NC}"
+        echo -e "${CYAN}${ICON_KEY} Public Key:${NC} ${peer}"
+        
+        # Get endpoint
+        ENDPOINT=$(wg show ${WG_INTERFACE} endpoints | grep "$peer" | awk '{print $2}')
+        if [ -n "$ENDPOINT" ]; then
+            echo -e "${BLUE}${ICON_NETWORK} Endpoint:${NC} ${ENDPOINT}"
+        fi
+        
+        # Get allowed IPs
+        ALLOWED_IPS=$(wg show ${WG_INTERFACE} allowed-ips | grep "$peer" | cut -f2)
+        if [ -n "$ALLOWED_IPS" ]; then
+            echo -e "${GREEN}${ICON_ARROW} Allowed IPs:${NC} ${ALLOWED_IPS}"
+        fi
+        
+        # Get latest handshake
+        HANDSHAKE=$(wg show ${WG_INTERFACE} latest-handshakes | grep "$peer" | awk '{print $2}')
+        if [ -n "$HANDSHAKE" ] && [ "$HANDSHAKE" != "0" ]; then
+            CURRENT_TIME=$(date +%s)
+            TIME_DIFF=$((CURRENT_TIME - HANDSHAKE))
+            
+            if [ $TIME_DIFF -lt 60 ]; then
+                HANDSHAKE_AGO="${TIME_DIFF} seconds ago"
+                COLOR="${GREEN}"
+            elif [ $TIME_DIFF -lt 3600 ]; then
+                HANDSHAKE_AGO="$((TIME_DIFF / 60)) minutes ago"
+                COLOR="${YELLOW}"
+            else
+                HANDSHAKE_AGO="$((TIME_DIFF / 3600)) hours ago"
+                COLOR="${RED}"
+            fi
+            echo -e "${COLOR}${ICON_CLOCK} Latest Handshake:${NC} ${HANDSHAKE_AGO}"
+        else
+            echo -e "${RED}${ICON_CLOCK} Latest Handshake:${NC} Never"
+        fi
+        
+        # Get transfer stats
+        TRANSFER=$(wg show ${WG_INTERFACE} transfer | grep "$peer" | awk '{print $2, $3}')
+        if [ -n "$TRANSFER" ]; then
+            RX=$(echo $TRANSFER | awk '{print $1}')
+            TX=$(echo $TRANSFER | awk '{print $2}')
+            RX_HUMAN=$(numfmt --to=iec-i --suffix=B $RX 2>/dev/null || echo "${RX}B")
+            TX_HUMAN=$(numfmt --to=iec-i --suffix=B $TX 2>/dev/null || echo "${TX}B")
+            echo -e "${MAGENTA}${ICON_RECEIVE} Received:${NC} ${RX_HUMAN}"
+            echo -e "${MAGENTA}${ICON_TRANSFER} Sent:${NC} ${TX_HUMAN}"
+        fi
+        
+        echo ""
+    done <<< "$PEERS"
+    
+    read -p "Press Enter to continue..."
+}
+
+# Ping all peers
+ping_peers() {
+    echo -e "${BLUE}${ICON_PING} Pinging All Peers${NC}"
+    echo -e "${GRAY}════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if ! ip link show ${WG_INTERFACE} &>/dev/null; then
+        echo -e "${RED}${ICON_CROSS} Interface ${WG_INTERFACE} is not active${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    # Get all allowed IPs (peer addresses)
+    ALLOWED_IPS=$(wg show ${WG_INTERFACE} allowed-ips | awk '{print $2}' | cut -d'/' -f1)
+    
+    if [ -z "$ALLOWED_IPS" ]; then
+        echo -e "${YELLOW}${ICON_INFO} No peers configured${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+    
+    PEER_NUM=0
+    ONLINE=0
+    OFFLINE=0
+    
+    while IFS= read -r ip; do
+        ((PEER_NUM++))
+        echo -e "${CYAN}Testing Peer #${PEER_NUM} (${ip})...${NC}"
+        
+        if ping -c 3 -W 2 ${ip} > /dev/null 2>&1; then
+            echo -e "${GREEN}${ICON_CHECK} ${ip} is ${BOLD}ONLINE${NC}"
+            ((ONLINE++))
+        else
+            echo -e "${RED}${ICON_CROSS} ${ip} is ${BOLD}OFFLINE${NC}"
+            ((OFFLINE++))
+        fi
+        echo ""
+    done <<< "$ALLOWED_IPS"
+    
+    echo -e "${GRAY}────────────────────────────────────────────────────${NC}"
+    echo -e "${WHITE}Summary:${NC} ${GREEN}${ONLINE} online${NC} | ${RED}${OFFLINE} offline${NC}"
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Show statistics with real-time updates
+show_stats() {
+    echo -e "${GREEN}${ICON_STATS} WireGuard Statistics (Real-time)${NC}"
+    echo -e "${GRAY}════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Press Enter to return to menu...${NC}"
+    echo ""
+
+    if ! ip link show ${WG_INTERFACE} &>/dev/null; then
+        echo -e "${RED}${ICON_CROSS} Interface ${WG_INTERFACE} is not active${NC}"
+        echo ""
+        read -p "Press Enter to continue..."
+        return
+    fi
+
+    # Function to get stats
+    get_stats() {
+        # Get listening port
+        PORT=$(wg show ${WG_INTERFACE} listen-port 2>/dev/null)
+
+        # Count peers
+        PEER_COUNT=$(wg show ${WG_INTERFACE} peers 2>/dev/null | wc -l)
+
+        # Count active peers (handshake within last 3 minutes)
+        ACTIVE_PEERS=0
+        CURRENT_TIME=$(date +%s)
+
+        while IFS= read -r peer; do
+            [ -z "$peer" ] && continue
+            HANDSHAKE=$(wg show ${WG_INTERFACE} latest-handshakes | grep "$peer" | awk '{print $2}')
+            if [ -n "$HANDSHAKE" ] && [ "$HANDSHAKE" != "0" ]; then
+                TIME_DIFF=$((CURRENT_TIME - HANDSHAKE))
+                if [ $TIME_DIFF -lt 180 ]; then
+                    ((ACTIVE_PEERS++))
+                fi
+            fi
+        done <<< "$(wg show ${WG_INTERFACE} peers 2>/dev/null)"
+
+        # Total transfer statistics
+        TOTAL_RX=0
+        TOTAL_TX=0
+
+        while read -r line; do
+            [ -z "$line" ] && continue
+            RX=$(echo $line | awk '{print $2}')
+            TX=$(echo $line | awk '{print $3}')
+            TOTAL_RX=$((TOTAL_RX + RX))
+            TOTAL_TX=$((TOTAL_TX + TX))
+        done <<< "$(wg show ${WG_INTERFACE} transfer 2>/dev/null)"
+
+        TOTAL_RX_HUMAN=$(numfmt --to=iec-i --suffix=B $TOTAL_RX 2>/dev/null || echo "${TOTAL_RX}B")
+        TOTAL_TX_HUMAN=$(numfmt --to=iec-i --suffix=B $TOTAL_TX 2>/dev/null || echo "${TOTAL_TX}B")
+
+        # Build single line output
+        TIMESTAMP=$(date '+%H:%M:%S')
+        OUTPUT="${CYAN}[${TIMESTAMP}]${NC} ${ICON_NETWORK}Port:${WHITE}${PORT}${NC} | ${ICON_LIST}Peers:${WHITE}${PEER_COUNT}${NC} | ${ICON_CHECK}Active:${GREEN}${ACTIVE_PEERS}${NC} | ${ICON_RECEIVE}RX:${MAGENTA}${TOTAL_RX_HUMAN}${NC} | ${ICON_TRANSFER}TX:${MAGENTA}${TOTAL_TX_HUMAN}${NC}"
+
+        echo -ne "\r${OUTPUT}"
+    }
+
+    # Clear the line first
+    echo -n "                                                                                                    "
+
+    # Real-time update loop
+    while true; do
+        get_stats
+
+        # Check if Enter was pressed (non-blocking)
+        read -t 0.5 -n 1 key
+        if [ $? -eq 0 ]; then
+            echo "" # New line after stats
+            echo ""
+            return
+        fi
+    done
+}
+
+# Main menu
+show_menu() {
+    show_header
+    
+    # Check if interface exists
+    if ip link show ${WG_INTERFACE} &>/dev/null; then
+        STATUS="${GREEN}${ICON_CHECK} ACTIVE${NC}"
+    else
+        STATUS="${RED}${ICON_CROSS} INACTIVE${NC}"
+    fi
+    
+    echo -e "${WHITE}Interface Status:${NC} ${STATUS}"
+    echo ""
+    echo -e "${GRAY}════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}1)${NC} ${ICON_ROCKET} Start WireGuard"
+    echo -e "${YELLOW}2)${NC} ${ICON_STOP} Stop WireGuard"
+    echo -e "${YELLOW}3)${NC} ${ICON_INFO} Show Status"
+    echo -e "${YELLOW}4)${NC} ${ICON_LIST} List Peers"
+    echo -e "${YELLOW}5)${NC} ${ICON_PING} Ping All Peers"
+    echo -e "${YELLOW}6)${NC} ${ICON_STATS} Show Statistics"
+    echo -e "${YELLOW}0)${NC} ${ICON_CROSS} Exit"
+    echo -e "${GRAY}════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# Main loop
+main() {
+    check_root
+    
+    while true; do
+        show_menu
+        read -p "$(echo -e ${CYAN}${ICON_ARROW} Select option: ${NC})" choice
+        echo ""
+        
+        case $choice in
+            1) start_wireguard ;;
+            2) stop_wireguard ;;
+            3) show_status ;;
+            4) list_peers ;;
+            5) ping_peers ;;
+            6) show_stats ;;
+            0) 
+                echo -e "${GREEN}${ICON_CHECK} Goodbye!${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}${ICON_CROSS} Invalid option${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Run main function
+main

@@ -1,9 +1,11 @@
 
-# `luks-expand.sh`
+# luks-expand.sh
 
-This script simplifies the task of resizing a LUKS-encrypted logical volume on a Linux system. 
+| In Use | Still Fixing | Used Once 
+|--------|--------------|-----------|
+|       | ?           | ✅           |
 
-It was created to address the challenges of navigating through complex and sometimes outdated information online. As the versions of LUKS change, some information becomes incomplete, incompatible, or simply ineffective. By encapsulating the necessary steps into a script, I can have a reliable starting point and a documented process that has been tested on systems I maintain.
+Simplifies resizing a LUKS v2 encrypted logical volume on Linux. Wraps the sequence of lvextend, cryptsetup resize, and filesystem resize into a single guided script with passphrase prompting. Created because online instructions for LUKS resize (on LVM + LUKS) tend to be complex and sometimes outdated.  It's been awhile since I worked on this.  I would test in a VM first if I were using it again to make sure things haven't changed.
 
 ## Usage
 0. Make certain you've made backups of the system and/or volumes being expanded

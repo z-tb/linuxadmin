@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# Fancy directory size display with colors and proper special character handling
+# Usage: script.sh [directory_path]
+
+# Use provided path or current directory
+target_path="${1:-.}"
+
+echo -e "\033[1;35m╔═══════════════════════════════════════════════════════════════╗\033[0m"
+echo -e "\033[1;35m║\033[1;33m                    Directory Sizes (MB)                       \033[1;35m║\033[0m"
+echo -e "\033[1;35m╚═══════════════════════════════════════════════════════════════╝\033[0m"
+echo -e "\033[1;34mPath: \033[1;37m$(realpath "$target_path")\033[0m"
+echo
+
+# Change to target directory and get sizes
+if cd "$target_path" 2>/dev/null; then
+    du -sm */ 2>/dev/null | sort -nr | while IFS=$'\t' read -r size dir; do
+        # Remove trailing slash from directory name
+        clean_dir="${dir%/}"
+        
+        # Color coding based on size
+        if [ "$size" -gt 1000 ]; then
+            color="\033[1;31m"  # Red for >1GB
+            icon="🔥"
+        elif [ "$size" -gt 100 ]; then
+            color="\033[1;33m"  # Yellow for >100MB
+            icon="⚡"
+        elif [ "$size" -gt 10 ]; then
+            color="\033[1;32m"  # Green for >10MB
+            icon="📁"
+        else
+            color="\033[1;36m"  # Cyan for small dirs
+            icon="📂"
+        fi
+        
+        printf "${color}${icon} %6s MB\033[0m  \033[1;37m%s\033[0m\n" "$size" "$clean_dir"
+    done
+    cd - >/dev/null
+else
+    echo -e "\033[1;31mError: Cannot access directory '$target_path'\033[0m"
+    exit 1
+fi
+
+echo
+echo -e "\033[1;35m────────────────────────────────────────────────────────────────\033[0m"
+
+# Total size of target directory
+total=$(du -sm "$target_path" 2>/dev/null | cut -f1)
+echo -e "\033[1;34m📊 Total size: \033[1;32m${total} MB\033[0m"
