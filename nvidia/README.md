@@ -2,7 +2,7 @@
 
 | In Use | Still Fixing |
 |--------|--------------|
-| ✅     | ❌           |
+|        | ❌           |
 
 Real-time GTK3 GPU and CPU monitor with smooth scrolling graphs.
 
