@@ -77,6 +77,8 @@ CP_SCROLL_IND     = 23   # scroll position indicator
 CP_STAT_ADD       = 24   # A — added files
 CP_STAT_MOD       = 25   # M — modified files
 CP_STAT_DEL       = 26   # D — deleted files
+CP_CONFLICT       = 27   # ⚠ merge conflict warning in status bar
+CP_CLEAN          = 28   # ✓ clean merge indicator in status bar
 
 # ─── Data types ───────────────────────────────────────────────────────────────
 
@@ -264,6 +266,59 @@ def load_commit_diff(sha: str, repo: Optional[str] = None) -> List[str]:
     if rc != 0:
         return [f"[error loading diff for {sha}]"]
     return [ln for ln in lines if ln]
+
+
+def detect_conflicts(src: str, cmp: str,
+                     repo: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Dry-run merge to check if merging `cmp` into `src` would produce conflicts.
+    Returns (has_conflicts, description).
+
+    Strategy:
+      1. Try `git merge-tree --write-tree src cmp`  (git ≥ 2.38, cleanest approach).
+         Exit 0 = clean, exit 1 = conflicts.
+      2. Fall back to classic 3-way `git merge-tree <base> src cmp` and scan for
+         conflict markers.  Works on older git but is less structured.
+    Does NOT touch the working tree or index in either case.
+    """
+    # ── Try modern merge-tree (git 2.38+) ────────────────────────────────────
+    lines, err, rc = _git(
+        "merge-tree", "--write-tree",
+        "--no-messages",   # suppress noise
+        src, cmp,
+        repo=repo,
+    )
+    if rc == 0:
+        return False, ""
+    if rc == 1:
+        # Conflict details come on stdout as path lines; summarise first few
+        conflict_paths = [ln.strip() for ln in lines if ln.strip()][:4]
+        detail = ", ".join(conflict_paths) if conflict_paths else "conflicts detected"
+        return True, detail
+
+    # rc == 129 or other: flag not supported — fall back to classic merge-tree
+    base_lines, _, base_rc = _git("merge-base", src, cmp, repo=repo)
+    if base_rc != 0 or not base_lines:
+        return False, ""   # Can't determine — stay silent
+
+    base = base_lines[0].strip()
+    mt_lines, _, mt_rc = _git("merge-tree", base, src, cmp, repo=repo)
+    if mt_rc != 0:
+        return False, ""
+
+    has_conflict = any(
+        ln.startswith("<<<<<<<") or "CONFLICT" in ln
+        for ln in mt_lines
+    )
+    if has_conflict:
+        # Extract file names from CONFLICT lines if present
+        paths = [
+            ln.split()[-1] for ln in mt_lines
+            if "CONFLICT" in ln and ln.split()
+        ][:4]
+        detail = ", ".join(paths) if paths else "conflict markers detected"
+        return True, detail
+    return False, ""
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -475,6 +530,9 @@ class App:
         self.status   = ""
         self.is_error = False
         self._layout: Optional[Layout] = None
+        # Structured status bar: list of (text, cp_id) — cp_id=0 means inherit bar color
+        self._status_parts: List[Tuple[str, int]] = []
+        self._conflict_str: str = ""   # "" = clean/unknown, else warning text
 
         self.src_pane = ListPane()
         self.cmp_pane = ListPane()
@@ -528,6 +586,8 @@ class App:
             (CP_STAT_ADD,      c(82,  curses.COLOR_GREEN),  bg),
             (CP_STAT_MOD,      c(214, curses.COLOR_YELLOW), bg),
             (CP_STAT_DEL,      c(196, curses.COLOR_RED),    bg),
+            (CP_CONFLICT,      c(196, curses.COLOR_RED),    bg),
+            (CP_CLEAN,         c(82,  curses.COLOR_GREEN),  bg),
         ]
         for pid, fg, bg_c in pairs:
             try:
@@ -564,6 +624,8 @@ class App:
     def _refresh_log(self):
         src = self.src_pane.locked
         cmp = self.cmp_pane.locked
+        self._conflict_str  = ""
+        self._status_parts  = []
         if not src or not cmp:
             self.log_pane.set_items([])
             return
@@ -571,14 +633,34 @@ class App:
         if err:
             self._msg(f"git log error: {err}", error=True)
             self.log_pane.set_items([])
+            return
+
+        self.log_pane.set_items(entries)
+        n_l = sum(1 for e in entries if e.direction == "left")
+        n_r = sum(1 for e in entries if e.direction == "right")
+
+        src_cp = CP_REMOTE_BRANCH if src.is_remote else CP_LOCAL_BRANCH
+        cmp_cp = CP_REMOTE_BRANCH if cmp.is_remote else CP_LOCAL_BRANCH
+
+        # "N commits ahead" phrasing: unambiguous direction
+        src_label = f" {n_l} commit{'s' if n_l != 1 else ''} ahead of {cmp.short}"
+        cmp_label = f" {n_r} commit{'s' if n_r != 1 else ''} ahead of {src.short}"
+
+        self._status_parts = [
+            ("◀ ", CP_TAG_SRC),
+            (src.short, src_cp),
+            (src_label + "   ", 0),
+            ("▶ ", CP_TAG_CMP),
+            (cmp.short, cmp_cp),
+            (cmp_label, 0),
+        ]
+
+        # Conflict check (runs git merge-tree, no working tree changes)
+        has_conflict, detail = detect_conflicts(src.short, cmp.short, self.repo)
+        if has_conflict:
+            self._conflict_str = f"  ⚠ merge conflicts: {detail}"
         else:
-            self.log_pane.set_items(entries)
-            n_l = sum(1 for e in entries if e.direction == "left")
-            n_r = sum(1 for e in entries if e.direction == "right")
-            self._msg(
-                f"◀ {n_l} commit(s) only in [{src.short}]   "
-                f"▶ {n_r} commit(s) only in [{cmp.short}]"
-            )
+            self._conflict_str = "  ✓ clean merge"
 
     def _msg(self, text: str, error: bool = False):
         self.status   = text
@@ -671,18 +753,18 @@ class App:
             is_cursor  = (abs_i == pane.cursor)
             is_locked  = (item is pane.locked)
 
-            if item.is_current:
-                base   = curses.color_pair(CP_CURRENT_BRANCH) | curses.A_BOLD
+            if is_locked:
+                base   = curses.color_pair(CP_LOCKED_BRANCH) | curses.A_BOLD
                 prefix = "● "
+            elif item.is_current:
+                base   = curses.color_pair(CP_CURRENT_BRANCH) | curses.A_BOLD
+                prefix = "* "
             elif item.is_remote:
                 base   = curses.color_pair(CP_REMOTE_BRANCH)
                 prefix = "  "
             else:
                 base   = curses.color_pair(CP_LOCAL_BRANCH)
                 prefix = "  "
-
-            if is_locked and not is_cursor:
-                base = curses.color_pair(CP_LOCKED_BRANCH) | curses.A_BOLD
 
             if is_cursor and focused:
                 attr = curses.color_pair(CP_HL_FOCUS) | curses.A_BOLD
@@ -702,7 +784,7 @@ class App:
 
         src = self.src_pane.locked.short if self.src_pane.locked else "none"
         cmp = self.cmp_pane.locked.short if self.cmp_pane.locked else "none"
-        self._box(top, left, h, w, f"LOG  ◀{src}  ▶{cmp}", focused)
+        self._box(top, left, h, w, f"LOG  ◀ {src}  │  ▶ {cmp}", focused)
 
         tag_w = ly.log_tag_w
         sha_w = ly.log_sha_w
@@ -738,16 +820,62 @@ class App:
         row, col, _, width = ly.status
         pane_name = ["SOURCE", "COMPARE-TO", "LOG"][self.active]
         right_tag = f" FOCUS:{pane_name} "
-        left_text = _trunc(self.status, width - len(right_tag) - 1)
-        full      = (left_text.ljust(width - len(right_tag)) + right_tag)[:width]
+        bar_attr  = curses.color_pair(CP_STATUS_BAR)
 
-        attr = curses.color_pair(CP_STATUS_BAR)
         if self.is_error:
-            attr = curses.color_pair(CP_ERROR) | curses.A_BOLD
+            # Plain error — single color, no segments
+            full = _trunc(self.status, width - len(right_tag) - 1)
+            full = (full.ljust(width - len(right_tag)) + right_tag)[:width]
+            try:
+                self.stdscr.addstr(row, col, full,
+                                   curses.color_pair(CP_ERROR) | curses.A_BOLD)
+            except curses.error:
+                pass
+            return
+
+        # Fill entire bar with background first
         try:
-            self.stdscr.addstr(row, col, full, attr)
+            self.stdscr.addstr(row, col, " " * width, bar_attr)
         except curses.error:
             pass
+
+        # Right-side focus tag
+        try:
+            self.stdscr.addstr(row, col + width - len(right_tag),
+                               right_tag, bar_attr | curses.A_BOLD)
+        except curses.error:
+            pass
+
+        avail = width - len(right_tag) - 1   # usable columns for left content
+
+        if self._status_parts:
+            # Render structured segments: branch names in their own colors
+            parts = list(self._status_parts)
+            # Append conflict indicator
+            if self._conflict_str:
+                is_conflict = self._conflict_str.lstrip().startswith("⚠")
+                parts.append((self._conflict_str,
+                               CP_CONFLICT if is_conflict else CP_CLEAN))
+
+            x = col
+            for text, cp in parts:
+                if x - col >= avail:
+                    break
+                remaining = avail - (x - col)
+                chunk = _trunc(text, remaining)
+                attr = (curses.color_pair(cp) | curses.A_BOLD) if cp else bar_attr
+                try:
+                    self.stdscr.addstr(row, x, chunk, attr)
+                except curses.error:
+                    pass
+                x += len(chunk)
+        else:
+            # Fallback: plain text status
+            text = _trunc(self.status, avail)
+            try:
+                self.stdscr.addstr(row, col, text, bar_attr)
+            except curses.error:
+                pass
 
     # ── Commit dialog ─────────────────────────────────────────────────────────
 
@@ -897,14 +1025,18 @@ class App:
             item = self.src_pane.current()
             if item:
                 self.src_pane.locked = item
-                self._msg(f"Source locked → {item.short}")
+                self._conflict_str  = ""
+                self._status_parts  = []
+                self._msg(f"Source locked → {item.short}  (checking merge…)")
                 self._refresh_log()
 
         elif self.active == PANE_COMPARE:
             item = self.cmp_pane.current()
             if item:
                 self.cmp_pane.locked = item
-                self._msg(f"Compare-to locked → {item.short}")
+                self._conflict_str  = ""
+                self._status_parts  = []
+                self._msg(f"Compare-to locked → {item.short}  (checking merge…)")
                 self._refresh_log()
 
         elif self.active == PANE_LOG:
