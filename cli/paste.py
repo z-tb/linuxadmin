@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+#
+#
+# Fetch from 'pass' and export as variable/terraform environment variables
+# export TF_VAR_aws_access_key_id=$(pass aws/dev/aws_access_key_id)
+# export TF_VAR_aws_secret_access_key=$(pass aws/dev/aws_secret_access_key)
+#
+
+import re
+import sys
+import termios
+import tty
+import subprocess
+import os
+
+class Color:
+    def __init__(self, scheme="SOLAR"):
+        if scheme.upper() == "DEFAULT":
+            self.HEADER = '\033[1;34m'  # Bold Blue
+            self.PROMPT = '\033[36m'    # Cyan
+            self.SUCCESS = '\033[32m'   # Green
+            self.WARNING = '\033[33m'   # Yellow
+            self.ERROR = '\033[31m'     # Red
+            self.DIM = '\033[2m'        # Faint Style
+            self.RESET = '\033[0m'
+            
+        elif scheme.upper() == "SOLAR":
+            self.HEADER = '\033[1;35m'  # Magenta
+            self.PROMPT = '\033[36m'    # Cyan
+            self.SUCCESS = '\033[32m'   # Green
+            self.WARNING = '\033[1;33m' # Bold Yellow
+            self.ERROR = '\033[1;31m'   # Bold Red
+            self.DIM = '\033[37m'        # Light Gray / Base1
+            self.RESET = '\033[0m'
+
+# Initialize with desired theme: "DEFAULT" or "SOLAR"
+Color = Color(scheme="SOLAR")
+
+def get_gpg_identities():
+    """Finds available primary GPG secret key fingerprints, ignoring subkeys."""
+    try:
+        result = subprocess.run(
+            ['gpg', '--list-secret-keys', '--with-colons'],
+            capture_output=True, text=True, check=True
+        )
+        fingerprints = []
+        is_primary_key = False
+        for line in result.stdout.splitlines():
+            fields = line.split(':')
+            if not fields: continue
+            if fields[0] == 'sec': is_primary_key = True
+            elif fields[0] == 'ssb': is_primary_key = False
+            if fields[0] == 'fpr' and is_primary_key and len(fields) > 9:
+                fingerprints.append(fields[9])
+                is_primary_key = False
+        return fingerprints
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+def get_gpg_uid(fingerprint):
+    """Fetches the primary human-readable User ID associated with a fingerprint."""
+    try:
+        result = subprocess.run(
+            ['gpg', '--list-keys', '--with-colons', fingerprint],
+            capture_output=True, text=True, check=True
+        )
+        for line in result.stdout.splitlines():
+            fields = line.split(':')
+            if fields and fields[0] == 'uid' and len(fields) > 9:
+                return fields[9]
+    except subprocess.CalledProcessError:
+        pass
+    return "Unknown User"
+
+def setup_gpg_and_pass():
+    print(f"{Color.HEADER}Checking for existing GPG identities...{Color.RESET}")
+    identities = get_gpg_identities()
+    selected_identity = None
+    
+    if identities:
+        if len(identities) == 1:
+            selected_identity = identities[0]
+            uid = get_gpg_uid(selected_identity)
+            print(f"{Color.WARNING}Using previously configured GnuPG identity:{Color.RESET} {selected_identity} {Color.DIM}({uid}){Color.RESET}")
+        else:
+            print(f"{Color.HEADER}Found {len(identities)} existing GPG identities:{Color.RESET}")
+            cached_uids = {}
+            for idx, fpr in enumerate(identities, 1):
+                uid = get_gpg_uid(fpr)
+                cached_uids[idx] = uid
+                print(f"  [{idx}] {fpr} {Color.DIM}({uid}){Color.RESET}")
+            while True:
+                try:
+                    choice = input(f"{Color.PROMPT}Select an identity (1-{len(identities)}): {Color.RESET}")
+                    selected_identity = identities[int(choice) - 1]
+                    break
+                except (ValueError, IndexError):
+                    print(f"{Color.ERROR}Invalid choice.{Color.RESET}")
+    else:
+        print(f"\n{Color.WARNING}No GPG secret keys found. Generating a new one...{Color.RESET}")
+        name = input(f"{Color.PROMPT}Enter your identifier/name for the GPG key: {Color.RESET}").strip()
+        if not name:
+            print(f"{Color.ERROR}Error: Name required.{Color.RESET}"); sys.exit(1)
+            
+        print(f"\n{Color.DIM}Working... one moment...{Color.RESET}")
+        
+        batch_config = f"Key-Type: RSA\nKey-Length: 3072\nSubkey-Type: RSA\nSubkey-Length: 3072\nName-Real: {name}\nExpire-Date: 0\n%commit"
+        config_filename = "/tmp/gpg_gen_config.txt"
+        with open(config_filename, "w") as f: f.write(batch_config)
+        try:
+            subprocess.run(['gpg', '--batch', '--generate-key', config_filename], check=True)
+            selected_identity = get_gpg_identities()[0]
+        except subprocess.CalledProcessError as e:
+            print(f"{Color.ERROR}GPG generation process failed.{Color.RESET}")
+            sys.exit(1)
+        finally:
+            if os.path.exists(config_filename): os.remove(config_filename)
+
+    if selected_identity:
+        try:
+            subprocess.run(['pass', 'init', selected_identity], check=True, stdout=subprocess.DEVNULL)
+            print(f"{Color.SUCCESS}Password store ready.{Color.RESET}")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(f"{Color.ERROR}Critical: Failed to initialize 'pass'. Is the pass package installed?{Color.RESET}")
+            sys.exit(1)
+
+def capture_masked_paste():
+    print(f"\n{Color.HEADER}Please paste your variables to store in key=value format{Color.RESET}")
+    print(f"{Color.DIM}--> Press Enter + Ctrl+D when finished. Press Ctrl+C or ESC to cancel. <--{Color.RESET}")
+    print(f"{Color.PROMPT}Paste now: {Color.RESET}", end="", flush=True)
+    
+    pasted_input = []
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    cancelled = False
+
+    try:
+        tty.setraw(fd)
+        while True:
+            char = sys.stdin.read(1)
+            if char == '\x04': 
+                break
+            if char in ('\x1b', '\x03'):
+                cancelled = True
+                break
+            pasted_input.append(char)
+            sys.stdout.write('\r\n' if char in ('\n', '\r') else '*')
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        
+    if cancelled:
+        print(f"\n{Color.WARNING}Paste window cancelled by user.{Color.RESET}")
+        sys.exit(0)
+        
+    return "".join(pasted_input)
+
+def detect_provider(var_name):
+    v = var_name.upper()
+    if v.startswith("AWS_"): return "aws"
+    elif v.startswith("GITHUB_") or v.startswith("GH_"): return "github"
+    elif v.startswith("AZURE_") or v.startswith("ARM_"): return "azure"
+    elif v.startswith("GOOGLE_") or v.startswith("GCP_") or v.startswith("GCLOUD_"): return "google"
+    elif v.startswith("DIGITALOCEAN_") or v.startswith("DO_"): return "digitalocean"
+    return "other"
+
+def strip_ansi(text):
+    """Removes ANSI escape color characters from string outputs."""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
+
+def get_toplevel_credential_types():
+    """Obtains and cleanses existing top-level directory names inside pass storage."""
+    try:
+        result = subprocess.run(['pass', 'ls'], capture_output=True, text=True)
+        lines = result.stdout.splitlines()
+        toplevels = []
+        for line in lines[1:]: # Skip the 'Password Store' base line
+            clean_line = strip_ansi(line)
+            # Match standard tree formatting symbols to extract first-level folders
+            match = re.match(r'^[├└]──\s+([a-zA-Z0-9_\-]+)', clean_line)
+            if match:
+                toplevels.append(match.group(1))
+        return sorted(list(set(toplevels)))
+    except Exception:
+        return []
+
+def pass_entry_exists(pass_path):
+    """Verifies if an operational key path is already defined inside pass."""
+    try:
+        res = subprocess.run(['pass', 'show', pass_path], capture_output=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def parse_paste_blob(text_blob):
+    """Splits variables at the first occurrence of '=' from the left, strips whitespace and surrounding quotes."""
+    variables = []
+    lines = text_blob.splitlines()
+    for line in lines:
+        line_str = line.strip()
+        if line_str.startswith("export "):
+            line_str = line_str[7:].strip()
+        if not line_str or "=" not in line_str:
+            continue
+        
+        key, val = line_str.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        
+        if len(val) >= 2 and ((val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))):
+            val = val[1:-1].strip()
+            
+        if key:
+            variables.append((key, val))
+    return variables
+
+def display_usage_instructions(stored_paths):
+    """Generates copy-pasteable Bash injection code for the saved variables."""
+    print(f"\n{Color.HEADER}To inject these credentials into your active shell environment, run:{Color.RESET}")
+    print(f"----------------------------------------------------------------------{Color.DIM}")
+    for var_name, pass_path in stored_paths:
+        print(f'export {var_name}=$(pass {pass_path})')
+    print(f"{Color.RESET}----------------------------------------------------------------------")
+
+def store_in_pass(text_blob):
+    variables = parse_paste_blob(text_blob)
+    
+    if not variables:
+        print(f"\n{Color.ERROR}No variables found or pattern mismatched.{Color.RESET}")
+        return
+
+    print(f"\n{Color.SUCCESS}Parsed {len(variables)} variables successfully.{Color.RESET}")
+    for var_name, _ in variables:
+        print(f" {Color.DIM}-{Color.RESET} {var_name}")
+    print()
+
+    detected_providers = [detect_provider(k) for k, _ in variables]
+    is_other = "other" in detected_providers
+
+    provider_type = None
+    if not is_other:
+        provider_type = detected_providers[0]
+    else:
+        while True:
+            toplevels = get_toplevel_credential_types()
+            print(f"{Color.HEADER}Available top-level credential folders:{Color.RESET}")
+            if toplevels:
+                for idx, folder in enumerate(toplevels, 1):
+                    print(f"  [{idx}] {folder}")
+            else:
+                print(f"  {Color.DIM}(No existing top-level directories found){Color.RESET}")
+            print()
+            
+            selection = input(f"{Color.PROMPT}Select folder number or type a new name (default: other): {Color.RESET}").strip()
+            
+            if not selection:
+                provider_type = "other"
+                break
+                
+            # Check if selection corresponds to a listed menu option index number
+            try:
+                idx_val = int(selection)
+                if 1 <= idx_val <= len(toplevels):
+                    provider_type = toplevels[idx_val - 1]
+                    break
+                else:
+                    print(f"{Color.ERROR}Menu selection index out of bounds.{Color.RESET}\n")
+                    continue
+            except ValueError:
+                # If selection is not a number, process it directly as a freeform name configuration string
+                if selection[0].isdigit():
+                    print(f"{Color.ERROR}Custom credential store names cannot begin with a number.{Color.RESET}\n")
+                    continue
+                provider_type = selection.lower()
+                break
+
+    while True:
+        env_name = input(f"{Color.PROMPT}Enter environment namespace (dev, prod, test): {Color.RESET}").strip().lower()
+        if env_name in ['dev', 'prod', 'test']: break
+        print(f"{Color.ERROR}Invalid environment.{Color.RESET}")
+
+    collisions = []
+    for var_name, _ in variables:
+        check_path = f"{provider_type}/{env_name}/{var_name}"
+        if pass_entry_exists(check_path):
+            collisions.append(check_path)
+
+    if collisions:
+        print(f"\n{Color.WARNING}Collision Warning! The following paths already exist in storage:{Color.RESET}")
+        for path in collisions:
+            print(f"  {Color.ERROR}!{Color.RESET} {path}")
+        print()
+        
+        while True:
+            print(f"{Color.HEADER}Collision Resolution Options:{Color.RESET}")
+            print("  [1] Overwrite all existing entries")
+            print("  [2] Go back to credential menu to select a different destination")
+            print("  [3] Cancel the operation entirely")
+            choice = input(f"{Color.PROMPT}Select action (1-3): {Color.RESET}").strip()
+            
+            if choice == '1':
+                break
+            elif choice == '2':
+                return store_in_pass(text_blob)
+            elif choice == '3':
+                print(f"\n{Color.WARNING}Operation cancelled by user.{Color.RESET}")
+                return
+            else:
+                print(f"{Color.ERROR}Invalid option.{Color.RESET}\n")
+
+    print(f"\n{Color.HEADER}Storing credentials...{Color.RESET}")
+    successful_stores = []
+    
+    for var_name, var_value in variables:
+        pass_path = f"{provider_type}/{env_name}/{var_name}"
+        
+        try:
+            subprocess.run(
+                ['pass', 'insert', '-e', '-f', pass_path],
+                input=var_value, text=True, check=True, 
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+            print(f" {Color.SUCCESS}✓{Color.RESET} Stored: {Color.DIM}{pass_path}{Color.RESET}")
+            successful_stores.append((var_name, pass_path))
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f" {Color.ERROR}✗{Color.RESET} Failed to store: {pass_path}")
+            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+                print(f"   {Color.ERROR}Reason: {e.stderr.strip()}{Color.RESET}")
+
+    if successful_stores:
+        display_usage_instructions(successful_stores)
+
+if __name__ == "__main__":
+    try:
+        setup_gpg_and_pass()
+        raw_paste = capture_masked_paste()
+        store_in_pass(raw_paste)
+    except KeyboardInterrupt:
+        print(f"\n\n{Color.WARNING}Operation aborted by user. Exiting cleanly.{Color.RESET}")
+        sys.exit(0)
