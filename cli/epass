@@ -294,7 +294,7 @@ def print_custom_help_and_exit(parser):
     entries = get_all_pass_entries()
     if entries:
         for var_name, pass_path in entries:
-            print(f"{Color.SUCCESS}export{Color.RESET} {var_name}={Color.DIM}\$(pass {pass_path}){Color.RESET}")
+            print(f"{Color.SUCCESS}export{Color.RESET} {var_name}={Color.DIM}$(pass {pass_path}){Color.RESET}")
     else:
         print(f"  {Color.DIM}(No encrypted items found inside ~/.password-store){Color.RESET}")
     print(f"----------------------------------------------------------------------")
