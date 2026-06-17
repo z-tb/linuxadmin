@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 #
-#
-#
-#
 # ==============================================================================
-# SCRIPT: paste.py
+# SCRIPT: epass
 # DESCRIPTION:
 #   An interactive utility designed to parse raw configuration blocks or environment 
 #   variables and securely commit them into a local 'pass' (GnuPG-encrypted) storage.
-#
 #   It processes variables based on key=value pairings, auto-detects common cloud
 #   providers (e.g., AWS, GCP, Azure, GitHub) or lets you provision custom, freeform
-#   top-level directories, organized under a chosen target namespace (dev/prod/test).
+#   top-level directories, organized neatly under a chosen target namespace (dev/prod/test).
 #
 # REQUIREMENTS:
 #   - Python 3.x
@@ -19,7 +15,7 @@
 #   - A configured GnuPG identity context.
 #
 # USAGE INSTRUCTIONS:
-#   1. Execute the tool: ./paste.py
+#   1. Execute the tool: ./epass [-u username]
 #   2. Confirm or select your preferred target GnuPG encryption key context.
 #   3. Paste your lines formatted as raw `KEY=VALUE` or standard shell `export KEY="VALUE"`.
 #   4. Finalize the stream paste capture by issuing: Enter -> Ctrl+D
@@ -27,12 +23,13 @@
 #   6. Copy the dynamically generated output snippet to instantly evaluate your 
 #      secrets in your current shell workflow.
 #
+#   * OPTIONS:
+#      -u USERNAME   Override or explicitly declare the fallback GPG identifier.
+#                    If absent, checks $LOGNAME, then prompts if necessary.
+#
+#   * NOTE: Abort input processing cleanly at any stage by issuing Ctrl+C or ESC.
 # ==============================================================================
 #
-# NOTE
-# Fetch from 'pass' and export as variable/terraform environment variables
-# export TF_VAR_aws_access_key_id=$(pass aws/dev/aws_access_key_id)
-# export TF_VAR_aws_secret_access_key=$(pass aws/dev/aws_secret_access_key)
 
 import re
 import sys
@@ -40,6 +37,7 @@ import termios
 import tty
 import subprocess
 import os
+import argparse
 
 class Color:
     def __init__(self, scheme="SOLAR"):
@@ -100,7 +98,7 @@ def get_gpg_uid(fingerprint):
         pass
     return "Unknown User"
 
-def setup_gpg_and_pass():
+def setup_gpg_and_pass(cli_user=None):
     print(f"{Color.HEADER}Checking for existing GPG identities...{Color.RESET}")
     identities = get_gpg_identities()
     selected_identity = None
@@ -126,9 +124,21 @@ def setup_gpg_and_pass():
                     print(f"{Color.ERROR}Invalid choice.{Color.RESET}")
     else:
         print(f"\n{Color.WARNING}No GPG secret keys found. Generating a new one...{Color.RESET}")
-        name = input(f"{Color.PROMPT}Enter your identifier/name for the GPG key: {Color.RESET}").strip()
+        
+        # Determine username/identity dynamically
+        name = None
+        if cli_user:
+            name = cli_user
+            print(f"{Color.DIM}Using identity from -u parameter: {name}{Color.RESET}")
+        elif os.environ.get("LOGNAME"):
+            name = os.environ.get("LOGNAME")
+            print(f"{Color.DIM}Using identity from environment ($LOGNAME): {name}{Color.RESET}")
+        else:
+            name = input(f"{Color.PROMPT}Enter your identifier/name for the GPG key: {Color.RESET}").strip()
+            
         if not name:
-            print(f"{Color.ERROR}Error: Name required.{Color.RESET}"); sys.exit(1)
+            print(f"{Color.ERROR}Error: GPG key identifier required.{Color.RESET}")
+            sys.exit(1)
             
         print(f"\n{Color.DIM}Working... one moment...{Color.RESET}")
         
@@ -360,8 +370,13 @@ def store_in_pass(text_blob):
         display_usage_instructions(successful_stores)
 
 if __name__ == "__main__":
+    # Configure the arguments parser to catch execution flags cleanly
+    parser = argparse.ArgumentParser(description="epass: Secure copy-paste wrapper for pass storage initialization.")
+    parser.add_argument("-u", "--user", type=str, help="Explicit user/account identity override for GPG generation context.")
+    args = parser.parse_args()
+
     try:
-        setup_gpg_and_pass()
+        setup_gpg_and_pass(cli_user=args.user)
         raw_paste = capture_masked_paste()
         store_in_pass(raw_paste)
     except KeyboardInterrupt:
