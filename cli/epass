@@ -15,7 +15,7 @@
 #   - A configured GnuPG identity context.
 #
 # USAGE INSTRUCTIONS:
-#   1. Execute the tool: ./epass [-u username]
+#   1. Execute the tool: ./epass [-u username] [-h]
 #   2. Confirm or select your preferred target GnuPG encryption key context.
 #   3. Paste your lines formatted as raw `KEY=VALUE` or standard shell `export KEY="VALUE"`.
 #   4. Finalize the stream paste capture by issuing: Enter -> Ctrl+D
@@ -26,6 +26,8 @@
 #   * OPTIONS:
 #      -u USERNAME   Override or explicitly declare the fallback GPG identifier.
 #                    If absent, checks $LOGNAME, then prompts if necessary.
+#      -h, --help    Show argument specifications along with an overview of injection
+#                    syntax for all active variables saved inside the store.
 #
 #   * NOTE: Abort input processing cleanly at any stage by issuing Ctrl+C or ESC.
 # ==============================================================================
@@ -215,13 +217,35 @@ def get_toplevel_credential_types():
         toplevels = []
         for line in lines[1:]: # Skip the 'Password Store' base line
             clean_line = strip_ansi(line)
-            # Match standard tree formatting symbols to extract first-level folders
             match = re.match(r'^[├└]──\s+([a-zA-Z0-9_\-]+)', clean_line)
             if match:
                 toplevels.append(match.group(1))
         return sorted(list(set(toplevels)))
     except Exception:
         return []
+
+def get_all_pass_entries():
+    """Recursively walks the local .password-store directory to find leaf file entries."""
+    store_dir = os.path.expanduser("~/.password-store")
+    if not os.path.exists(store_dir):
+        return []
+    
+    entries = []
+    for root, dirs, files in os.walk(store_dir):
+        # Skip git metadata directories if they exist
+        if '.git' in dirs:
+            dirs.remove('.git')
+        for file in files:
+            if file.endswith(".gpg"):
+                # Construct relative path from password store base
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, store_dir)
+                # Strip out .gpg extension for pass usage syntax compatibility
+                pass_path = os.path.splitext(rel_path)[0]
+                # The terminal directory item/filename acts directly as the environment variable key
+                var_name = os.path.basename(pass_path)
+                entries.append((var_name, pass_path))
+    return sorted(entries, key=lambda x: x[1])
 
 def pass_entry_exists(pass_path):
     """Verifies if an operational key path is already defined inside pass."""
@@ -261,6 +285,21 @@ def display_usage_instructions(stored_paths):
         print(f'export {var_name}=$(pass {pass_path})')
     print(f"{Color.RESET}----------------------------------------------------------------------")
 
+def print_custom_help_and_exit(parser):
+    """Prints standard argument descriptions followed by a dump of current store environment exports."""
+    parser.print_help()
+    print(f"\n{Color.HEADER}Current Password Store Variables & Shell Injection Code:{Color.RESET}")
+    print(f"----------------------------------------------------------------------")
+    
+    entries = get_all_pass_entries()
+    if entries:
+        for var_name, pass_path in entries:
+            print(f"{Color.SUCCESS}export{Color.RESET} {var_name}={Color.DIM}\$(pass {pass_path}){Color.RESET}")
+    else:
+        print(f"  {Color.DIM}(No encrypted items found inside ~/.password-store){Color.RESET}")
+    print(f"----------------------------------------------------------------------")
+    sys.exit(0)
+
 def store_in_pass(text_blob):
     variables = parse_paste_blob(text_blob)
     
@@ -296,7 +335,6 @@ def store_in_pass(text_blob):
                 provider_type = "other"
                 break
                 
-            # Check if selection corresponds to a listed menu option index number
             try:
                 idx_val = int(selection)
                 if 1 <= idx_val <= len(toplevels):
@@ -306,7 +344,6 @@ def store_in_pass(text_blob):
                     print(f"{Color.ERROR}Menu selection index out of bounds.{Color.RESET}\n")
                     continue
             except ValueError:
-                # If selection is not a number, process it directly as a freeform name configuration string
                 if selection[0].isdigit():
                     print(f"{Color.ERROR}Custom credential store names cannot begin with a number.{Color.RESET}\n")
                     continue
@@ -370,10 +407,19 @@ def store_in_pass(text_blob):
         display_usage_instructions(successful_stores)
 
 if __name__ == "__main__":
-    # Configure the arguments parser to catch execution flags cleanly
-    parser = argparse.ArgumentParser(description="epass: Secure copy-paste wrapper for pass storage initialization.")
+    # Disable default help behavior so we can safely hijack -h and --help
+    parser = argparse.ArgumentParser(
+        description="epass: Secure copy-paste wrapper for pass storage initialization.",
+        add_help=False
+    )
     parser.add_argument("-u", "--user", type=str, help="Explicit user/account identity override for GPG generation context.")
+    parser.add_argument("-h", "--help", action="store_true", help="Show this help message layout along with all current password store items formatted as shell environment injection snippets.")
+    
     args = parser.parse_args()
+
+    # Route out right away if help flags are present
+    if args.help:
+        print_custom_help_and_exit(parser)
 
     try:
         setup_gpg_and_pass(cli_user=args.user)
