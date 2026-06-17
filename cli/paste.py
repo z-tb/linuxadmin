@@ -1,10 +1,38 @@
 #!/usr/bin/env python3
 #
 #
+#
+#
+# ==============================================================================
+# SCRIPT: paste.py
+# DESCRIPTION:
+#   An interactive utility designed to parse raw configuration blocks or environment 
+#   variables and securely commit them into a local 'pass' (GnuPG-encrypted) storage.
+#
+#   It processes variables based on key=value pairings, auto-detects common cloud
+#   providers (e.g., AWS, GCP, Azure, GitHub) or lets you provision custom, freeform
+#   top-level directories, organized under a chosen target namespace (dev/prod/test).
+#
+# REQUIREMENTS:
+#   - Python 3.x
+#   - 'pass' (The Standard Unix Password Manager binary) installed and accessible.
+#   - A configured GnuPG identity context.
+#
+# USAGE INSTRUCTIONS:
+#   1. Execute the tool: ./paste.py
+#   2. Confirm or select your preferred target GnuPG encryption key context.
+#   3. Paste your lines formatted as raw `KEY=VALUE` or standard shell `export KEY="VALUE"`.
+#   4. Finalize the stream paste capture by issuing: Enter -> Ctrl+D
+#   5. Choose your structural folder routing and target environment when prompted.
+#   6. Copy the dynamically generated output snippet to instantly evaluate your 
+#      secrets in your current shell workflow.
+#
+# ==============================================================================
+#
+# NOTE
 # Fetch from 'pass' and export as variable/terraform environment variables
 # export TF_VAR_aws_access_key_id=$(pass aws/dev/aws_access_key_id)
 # export TF_VAR_aws_secret_access_key=$(pass aws/dev/aws_secret_access_key)
-#
 
 import re
 import sys
