@@ -2,7 +2,7 @@
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GLib, Gdk
+from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 import cairo
 import os
 # Suppress matplotlib import - scapy pulls it in for optional plotting
@@ -25,6 +25,16 @@ MAX_INTERFACE_CHARS = 20
 SERIES_TIME_WINDOW = 300  # seconds (5 minutes)
 REVERSE_DOCKER_BRIDGE_COLORS = False
 GRAPH_UPDATE_INTERVAL = 1000  # milliseconds
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
 
 class NetworkStats:
     def __init__(self):
@@ -994,6 +1004,23 @@ def main():
     
     # Create and run the application
     try:
+        # Method 1: Try to load from your custom icon file
+        icon_path = get_resource_path("images/network-monitor/48x48/netchoo.png")
+        
+        if os.path.exists(icon_path):
+            try:
+                icon = GdkPixbuf.Pixbuf.new_from_file_at_size(icon_path, 48, 48)
+                Gtk.Window.set_default_icon(icon)
+                print(f"Loaded custom icon from: {icon_path}")
+            except Exception as e:
+                print(f"Failed to load custom icon: {e}")
+                # Fallback to system icon
+                Gtk.Window.set_default_icon_name("network-wired")
+        else:
+            print(f"Icon file not found at: {icon_path}")
+            # Fallback to system icon
+            Gtk.Window.set_default_icon_name("network-wired")
+        
         app = NetworkMonitor()
         app.show_all()
         Gtk.main()
@@ -1005,6 +1032,7 @@ def main():
         return 1
     
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
