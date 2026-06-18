@@ -4,32 +4,14 @@
 # SCRIPT: epass
 # DESCRIPTION:
 #   An interactive utility designed to parse raw configuration blocks or environment 
-#   variables and securely commit them into a local 'pass' (GnuPG-encrypted) storage.
+#   variables and securely commit them into a local 'gopass' (age-encrypted) storage.
 #   It processes variables based on key=value pairings, auto-detects common cloud
 #   providers (e.g., AWS, GCP, Azure, GitHub) or lets you provision custom, freeform
 #   top-level directories, organized neatly under a chosen target namespace (dev/prod/test).
 #
 # REQUIREMENTS:
 #   - Python 3.x
-#   - 'pass' (The Standard Unix Password Manager binary) installed and accessible.
-#   - A configured GnuPG identity context.
-#
-# USAGE INSTRUCTIONS:
-#   1. Execute the tool: ./epass [-u username] [-h]
-#   2. Confirm or select your preferred target GnuPG encryption key context.
-#   3. Paste your lines formatted as raw `KEY=VALUE` or standard shell `export KEY="VALUE"`.
-#   4. Finalize the stream paste capture by issuing: Enter -> Ctrl+D
-#   5. Choose your structural folder routing and target environment when prompted.
-#   6. Copy the dynamically generated output snippet to instantly evaluate your 
-#      secrets in your current shell workflow.
-#
-#   * OPTIONS:
-#      -u USERNAME   Override or explicitly declare the fallback GPG identifier.
-#                    If absent, checks $LOGNAME, then prompts if necessary.
-#      -h, --help    Show argument specifications along with an overview of injection
-#                    syntax for all active variables saved inside the store.
-#
-#   * NOTE: Abort input processing cleanly at any stage by issuing Ctrl+C or ESC.
+#   - 'gopass' (The Next-Generation Password Manager binary) installed and accessible.
 # ==============================================================================
 #
 
@@ -39,129 +21,89 @@ import termios
 import tty
 import subprocess
 import os
+import shutil
 import argparse
+
+# Audit Item 1: Strict pattern verification to avoid injection inside shell code or file layout paths
+VALID_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 class Color:
     def __init__(self, scheme="SOLAR"):
         if scheme.upper() == "DEFAULT":
-            self.HEADER = '\033[1;34m'  # Bold Blue
-            self.PROMPT = '\033[36m'    # Cyan
-            self.SUCCESS = '\033[32m'   # Green
-            self.WARNING = '\033[33m'   # Yellow
-            self.ERROR = '\033[31m'     # Red
-            self.DIM = '\033[2m'        # Faint Style
+            self.HEADER = '\033[1;34m'
+            self.PROMPT = '\033[36m'
+            self.SUCCESS = '\033[32m'
+            self.WARNING = '\033[33m'
+            self.ERROR = '\033[31m'
+            self.DIM = '\033[2m'
             self.RESET = '\033[0m'
-            
         elif scheme.upper() == "SOLAR":
-            self.HEADER = '\033[1;35m'  # Magenta
-            self.PROMPT = '\033[36m'    # Cyan
-            self.SUCCESS = '\033[32m'   # Green
-            self.WARNING = '\033[1;33m' # Bold Yellow
-            self.ERROR = '\033[1;31m'   # Bold Red
-            self.DIM = '\033[37m'        # Light Gray / Base1
+            self.HEADER = '\033[1;35m'
+            self.PROMPT = '\033[36m'
+            self.SUCCESS = '\033[32m'
+            self.WARNING = '\033[1;33m'
+            self.ERROR = '\033[1;31m'
+            self.DIM = '\033[37m'
             self.RESET = '\033[0m'
 
-# Initialize with desired theme: "DEFAULT" or "SOLAR"
 Color = Color(scheme="SOLAR")
 
-def get_gpg_identities():
-    """Finds available primary GPG secret key fingerprints, ignoring subkeys."""
-    try:
-        result = subprocess.run(
-            ['gpg', '--list-secret-keys', '--with-colons'],
-            capture_output=True, text=True, check=True
-        )
-        fingerprints = []
-        is_primary_key = False
-        for line in result.stdout.splitlines():
-            fields = line.split(':')
-            if not fields: continue
-            if fields[0] == 'sec': is_primary_key = True
-            elif fields[0] == 'ssb': is_primary_key = False
-            if fields[0] == 'fpr' and is_primary_key and len(fields) > 9:
-                fingerprints.append(fields[9])
-                is_primary_key = False
-        return fingerprints
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-
-def get_gpg_uid(fingerprint):
-    """Fetches the primary human-readable User ID associated with a fingerprint."""
-    try:
-        result = subprocess.run(
-            ['gpg', '--list-keys', '--with-colons', fingerprint],
-            capture_output=True, text=True, check=True
-        )
-        for line in result.stdout.splitlines():
-            fields = line.split(':')
-            if fields and fields[0] == 'uid' and len(fields) > 9:
-                return fields[9]
-    except subprocess.CalledProcessError:
-        pass
-    return "Unknown User"
-
-def setup_gpg_and_pass(cli_user=None):
-    print(f"{Color.HEADER}Checking for existing GPG identities...{Color.RESET}")
-    identities = get_gpg_identities()
-    selected_identity = None
+def setup_gopass_and_age():
+    """Verifies gopass capability, enforces core.useagent, and self-heals broken stores."""
+    print(f"{Color.HEADER}Verifying gopass capability and backend availability...{Color.RESET}")
     
-    if identities:
-        if len(identities) == 1:
-            selected_identity = identities[0]
-            uid = get_gpg_uid(selected_identity)
-            print(f"{Color.WARNING}Using previously configured GnuPG identity:{Color.RESET} {selected_identity} {Color.DIM}({uid}){Color.RESET}")
-        else:
-            print(f"{Color.HEADER}Found {len(identities)} existing GPG identities:{Color.RESET}")
-            cached_uids = {}
-            for idx, fpr in enumerate(identities, 1):
-                uid = get_gpg_uid(fpr)
-                cached_uids[idx] = uid
-                print(f"  [{idx}] {fpr} {Color.DIM}({uid}){Color.RESET}")
-            while True:
-                try:
-                    choice = input(f"{Color.PROMPT}Select an identity (1-{len(identities)}): {Color.RESET}")
-                    selected_identity = identities[int(choice) - 1]
-                    break
-                except (ValueError, IndexError):
-                    print(f"{Color.ERROR}Invalid choice.{Color.RESET}")
-    else:
-        print(f"\n{Color.WARNING}No GPG secret keys found. Generating a new one...{Color.RESET}")
-        
-        # Determine username/identity dynamically
-        name = None
-        if cli_user:
-            name = cli_user
-            print(f"{Color.DIM}Using identity from -u parameter: {name}{Color.RESET}")
-        elif os.environ.get("LOGNAME"):
-            name = os.environ.get("LOGNAME")
-            print(f"{Color.DIM}Using identity from environment ($LOGNAME): {name}{Color.RESET}")
-        else:
-            name = input(f"{Color.PROMPT}Enter your identifier/name for the GPG key: {Color.RESET}").strip()
-            
-        if not name:
-            print(f"{Color.ERROR}Error: GPG key identifier required.{Color.RESET}")
-            sys.exit(1)
-            
-        print(f"\n{Color.DIM}Working... one moment...{Color.RESET}")
-        
-        batch_config = f"Key-Type: RSA\nKey-Length: 3072\nSubkey-Type: RSA\nSubkey-Length: 3072\nName-Real: {name}\nExpire-Date: 0\n%commit"
-        config_filename = "/tmp/gpg_gen_config.txt"
-        with open(config_filename, "w") as f: f.write(batch_config)
-        try:
-            subprocess.run(['gpg', '--batch', '--generate-key', config_filename], check=True)
-            selected_identity = get_gpg_identities()[0]
-        except subprocess.CalledProcessError as e:
-            print(f"{Color.ERROR}GPG generation process failed.{Color.RESET}")
-            sys.exit(1)
-        finally:
-            if os.path.exists(config_filename): os.remove(config_filename)
+    config_file = os.path.expanduser("~/.config/gopass/config")
+    default_store_path = os.path.expanduser("~/.local/share/gopass/stores/root")
+    
+    try:
+        subprocess.run(['gopass', 'version'], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print(f"{Color.ERROR}Critical: 'gopass' binary is not installed or accessible in PATH.{Color.RESET}")
+        sys.exit(1)
 
-    if selected_identity:
+    # Multi-tier functional probe check to bypass empty/broken false-positives
+    is_fully_functional = False
+    if os.path.exists(config_file) and os.path.exists(default_store_path):
         try:
-            subprocess.run(['pass', 'init', selected_identity], check=True, stdout=subprocess.DEVNULL)
-            print(f"{Color.SUCCESS}Password store ready.{Color.RESET}")
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print(f"{Color.ERROR}Critical: Failed to initialize 'pass'. Is the pass package installed?{Color.RESET}")
+            test_path = "healthcheck/probe"
+            subprocess.run(
+                ['gopass', 'insert', '--force', test_path],
+                input="probe_status_ok", text=True, capture_output=True, check=True
+            )
+            subprocess.run(['gopass', 'rm', '--force', test_path], capture_output=True, check=True)
+            is_fully_functional = True
+        except subprocess.CalledProcessError:
+            is_fully_functional = False
+
+    if is_fully_functional:
+        print(f"{Color.SUCCESS}Gopass store verified, active, and fully writeable.{Color.RESET}")
+        # Enforce memory caching agent usage to unblock downstream subshells
+        subprocess.run(['gopass', 'config', 'core.useagent', 'true'], capture_output=True)
+    else:
+        print(f"\n{Color.WARNING}Gopass store is uninitialized or in a broken state.{Color.RESET}")
+        print(f"{Color.DIM}Resetting configuration environment for clean 'age' initialization...{Color.RESET}")
+        
+        for path in [config_file, default_store_path]:
+            if os.path.exists(path):
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except Exception:
+                    pass
+
+        if sys.stdin.isatty():
+            os.environ["GPG_TTY"] = os.ttyname(sys.stdin.fileno())
+
+        try:
+            print(f"{Color.DIM}Launching native gopass wizard (age crypto + flat filesystem)...{Color.RESET}")
+            subprocess.run(['gopass', 'setup', '--crypto', 'age', '--storage', 'fs'], check=True)
+            # Post-setup optimization enforcement
+            subprocess.run(['gopass', 'config', 'core.useagent', 'true'], capture_output=True)
+            print(f"\n{Color.SUCCESS}Gopass vault setup successfully initialized with age encryption.{Color.RESET}")
+        except subprocess.CalledProcessError:
+            print(f"\n{Color.ERROR}Initialization workflow aborted or failed.{Color.RESET}")
             sys.exit(1)
 
 def capture_masked_paste():
@@ -205,59 +147,53 @@ def detect_provider(var_name):
     return "other"
 
 def strip_ansi(text):
-    """Removes ANSI escape color characters from string outputs."""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
 def get_toplevel_credential_types():
-    """Obtains and cleanses existing top-level directory names inside pass storage."""
     try:
-        result = subprocess.run(['pass', 'ls'], capture_output=True, text=True)
+        result = subprocess.run(['gopass', 'ls'], capture_output=True, text=True)
         lines = result.stdout.splitlines()
         toplevels = []
-        for line in lines[1:]: # Skip the 'Password Store' base line
-            clean_line = strip_ansi(line)
+        for line in lines:
+            clean_line = strip_ansi(line).strip()
             match = re.match(r'^[├└]──\s+([a-zA-Z0-9_\-]+)', clean_line)
             if match:
                 toplevels.append(match.group(1))
+            elif re.match(r'^[a-zA-Z0-9_\-]+$', clean_line):
+                toplevels.append(clean_line)
         return sorted(list(set(toplevels)))
     except Exception:
         return []
 
-def get_all_pass_entries():
-    """Recursively walks the local .password-store directory to find leaf file entries."""
-    store_dir = os.path.expanduser("~/.password-store")
-    if not os.path.exists(store_dir):
-        return []
-    
-    entries = []
-    for root, dirs, files in os.walk(store_dir):
-        # Skip git metadata directories if they exist
-        if '.git' in dirs:
-            dirs.remove('.git')
-        for file in files:
-            if file.endswith(".gpg"):
-                # Construct relative path from password store base
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, store_dir)
-                # Strip out .gpg extension for pass usage syntax compatibility
-                pass_path = os.path.splitext(rel_path)[0]
-                # The terminal directory item/filename acts directly as the environment variable key
-                var_name = os.path.basename(pass_path)
-                entries.append((var_name, pass_path))
-    return sorted(entries, key=lambda x: x[1])
-
-def pass_entry_exists(pass_path):
-    """Verifies if an operational key path is already defined inside pass."""
+def get_all_gopass_entries():
     try:
-        res = subprocess.run(['pass', 'show', pass_path], capture_output=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(['gopass', 'list', '--flat'], capture_output=True, text=True)
+        if result.returncode != 0:
+            return []
+        
+        entries = []
+        for line in result.stdout.splitlines():
+            pass_path = line.strip()
+            if not pass_path:
+                continue
+            var_name = pass_path.split('/')[-1]
+            if VALID_KEY.match(var_name):
+                entries.append((var_name, pass_path))
+        return sorted(entries, key=lambda x: x[1])
+    except Exception:
+        return []
+
+def gopass_entry_exists(pass_path):
+    try:
+        res = subprocess.run(['gopass', 'show', pass_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return res.returncode == 0
     except Exception:
         return False
 
 def parse_paste_blob(text_blob):
-    """Splits variables at the first occurrence of '=' from the left, strips whitespace and surrounding quotes."""
     variables = []
+    skipped = []
     lines = text_blob.splitlines()
     for line in lines:
         line_str = line.strip()
@@ -274,157 +210,122 @@ def parse_paste_blob(text_blob):
             val = val[1:-1].strip()
             
         if key:
-            variables.append((key, val))
-    return variables
+            if VALID_KEY.match(key):
+                variables.append((key, val))
+            else:
+                skipped.append(key)
+    return variables, skipped
 
-def display_usage_instructions(stored_paths):
-    """Generates copy-pasteable Bash injection code for the saved variables."""
+def display_usage_instructions(provider, env):
+    """Generates an explicit copy-paste evaluation loop snippet."""
+    folder_path = f"{provider}/{env}"
     print(f"\n{Color.HEADER}To inject these credentials into your active shell environment, run:{Color.RESET}")
-    print(f"----------------------------------------------------------------------{Color.DIM}")
-    for var_name, pass_path in stored_paths:
-        print(f'export {var_name}=$(pass {pass_path})')
-    print(f"{Color.RESET}----------------------------------------------------------------------")
+    print(f"----------------------------------------------------------------------")
+    print(f"for secret in $(gopass list --flat {folder_path}); do")
+    print(f"  var_name=${{secret##*/}}")
+    print(f"  export \"$var_name\"=\"$(gopass show -f $secret)\"")
+    print(f"done")
+    print(f"----------------------------------------------------------------------")
+    print(f"{Color.DIM}* Note: Your master passphrase will be requested once to prime the agent,{Color.RESET}")
+    print(f"{Color.DIM}  and all keys will populate cleanly without subshell pinentry hangs.{Color.RESET}")
 
 def print_custom_help_and_exit(parser):
-    """Prints standard argument descriptions followed by a dump of current store environment exports."""
     parser.print_help()
-    print(f"\n{Color.HEADER}Current Password Store Variables & Shell Injection Code:{Color.RESET}")
+    print(f"\n{Color.HEADER}Current Gopass Store Injection Commands:{Color.RESET}")
     print(f"----------------------------------------------------------------------")
     
-    entries = get_all_pass_entries()
+    entries = get_all_gopass_entries()
     if entries:
-        for var_name, pass_path in entries:
-            print(f"{Color.SUCCESS}export{Color.RESET} {var_name}={Color.DIM}$(pass {pass_path}){Color.RESET}")
+        namespaces = sorted(list(set([ '/'.join(p[1].split('/')[:-1]) for p in entries ])))
+        for ns in namespaces:
+            print(f"{Color.SUCCESS}# Load {ns} Environment:{Color.RESET}")
+            print(f"for secret in $(gopass list --flat {ns}); do var_name=${{secret##*/}}; export \"$var_name\"=\"$(gopass show -f $secret)\"; done\n")
     else:
-        print(f"  {Color.DIM}(No encrypted items found inside ~/.password-store){Color.RESET}")
+        print(f"  {Color.DIM}(No encrypted items found inside your root gopass store){Color.RESET}")
     print(f"----------------------------------------------------------------------")
     sys.exit(0)
 
-def store_in_pass(text_blob):
-    variables = parse_paste_blob(text_blob)
+def store_in_gopass(text_blob):
+    variables, skipped = parse_paste_blob(text_blob)
+    
+    if skipped:
+        print(f"\n{Color.WARNING}Security Warning: Ignored inputs due to invalid formatting:{Color.RESET}")
+        for invalid_item in skipped:
+            print(f"  {Color.ERROR}!{Color.RESET} {invalid_item[:50]}")
     
     if not variables:
-        print(f"\n{Color.ERROR}No variables found or pattern mismatched.{Color.RESET}")
+        print(f"\n{Color.ERROR}No safe variable pairs discovered.{Color.RESET}")
         return
 
     print(f"\n{Color.SUCCESS}Parsed {len(variables)} variables successfully.{Color.RESET}")
-    for var_name, _ in variables:
-        print(f" {Color.DIM}-{Color.RESET} {var_name}")
-    print()
-
+    
     detected_providers = [detect_provider(k) for k, _ in variables]
-    is_other = "other" in detected_providers
-
-    provider_type = None
-    if not is_other:
-        provider_type = detected_providers[0]
-    else:
+    provider_type = detected_providers[0] if "other" not in detected_providers else None
+    
+    if not provider_type:
         while True:
             toplevels = get_toplevel_credential_types()
-            print(f"{Color.HEADER}Available top-level credential folders:{Color.RESET}")
-            if toplevels:
-                for idx, folder in enumerate(toplevels, 1):
-                    print(f"  [{idx}] {folder}")
-            else:
-                print(f"  {Color.DIM}(No existing top-level directories found){Color.RESET}")
-            print()
+            print(f"{Color.HEADER}Top-level credential folders:{Color.RESET}")
+            for idx, folder in enumerate(toplevels, 1):
+                print(f"  [{idx}] {folder}")
             
-            selection = input(f"{Color.PROMPT}Select folder number or type a new name (default: other): {Color.RESET}").strip()
-            
+            selection = input(f"{Color.PROMPT}Select index or type a new name: {Color.RESET}").strip()
             if not selection:
                 provider_type = "other"
                 break
-                
             try:
                 idx_val = int(selection)
                 if 1 <= idx_val <= len(toplevels):
                     provider_type = toplevels[idx_val - 1]
                     break
-                else:
-                    print(f"{Color.ERROR}Menu selection index out of bounds.{Color.RESET}\n")
-                    continue
             except ValueError:
-                if selection[0].isdigit():
-                    print(f"{Color.ERROR}Custom credential store names cannot begin with a number.{Color.RESET}\n")
-                    continue
-                provider_type = selection.lower()
-                break
+                if re.match(r'^[a-z0-9_-]+$', selection.lower()) and not selection[0].isdigit():
+                    provider_type = selection.lower()
+                    break
+                print(f"{Color.ERROR}Invalid directory name standard.{Color.RESET}\n")
 
     while True:
         env_name = input(f"{Color.PROMPT}Enter environment namespace (dev, prod, test): {Color.RESET}").strip().lower()
         if env_name in ['dev', 'prod', 'test']: break
         print(f"{Color.ERROR}Invalid environment.{Color.RESET}")
 
-    collisions = []
-    for var_name, _ in variables:
-        check_path = f"{provider_type}/{env_name}/{var_name}"
-        if pass_entry_exists(check_path):
-            collisions.append(check_path)
+    collisions = [f"{provider_type}/{env_name}/{k}" for k, _ in variables if gopass_entry_exists(f"{provider_type}/{env_name}/{k}")]
 
     if collisions:
-        print(f"\n{Color.WARNING}Collision Warning! The following paths already exist in storage:{Color.RESET}")
-        for path in collisions:
-            print(f"  {Color.ERROR}!{Color.RESET} {path}")
-        print()
-        
-        while True:
-            print(f"{Color.HEADER}Collision Resolution Options:{Color.RESET}")
-            print("  [1] Overwrite all existing entries")
-            print("  [2] Go back to credential menu to select a different destination")
-            print("  [3] Cancel the operation entirely")
-            choice = input(f"{Color.PROMPT}Select action (1-3): {Color.RESET}").strip()
-            
-            if choice == '1':
-                break
-            elif choice == '2':
-                return store_in_pass(text_blob)
-            elif choice == '3':
-                print(f"\n{Color.WARNING}Operation cancelled by user.{Color.RESET}")
-                return
-            else:
-                print(f"{Color.ERROR}Invalid option.{Color.RESET}\n")
+        print(f"\n{Color.WARNING}Collision Warning! Paths exist:{Color.RESET}")
+        for path in collisions: print(f"  ! {path}")
+        choice = input(f"\n{Color.PROMPT}Overwrite all? [1=Yes, 2=Re-choose destination, 3=Cancel]: {Color.RESET}").strip()
+        if choice == '2': return store_in_gopass(text_blob)
+        if choice != '1': return
 
-    print(f"\n{Color.HEADER}Storing credentials...{Color.RESET}")
-    successful_stores = []
+    print(f"\n{Color.HEADER}Storing credentials into gopass...{Color.RESET}")
     
     for var_name, var_value in variables:
         pass_path = f"{provider_type}/{env_name}/{var_name}"
-        
         try:
             subprocess.run(
-                ['pass', 'insert', '-e', '-f', pass_path],
+                ['gopass', 'insert', '--force', pass_path],
                 input=var_value, text=True, check=True, 
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
             )
             print(f" {Color.SUCCESS}✓{Color.RESET} Stored: {Color.DIM}{pass_path}{Color.RESET}")
-            successful_stores.append((var_name, pass_path))
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f" {Color.ERROR}✗{Color.RESET} Failed to store: {pass_path}")
-            if isinstance(e, subprocess.CalledProcessError) and e.stderr:
-                print(f"   {Color.ERROR}Reason: {e.stderr.strip()}{Color.RESET}")
+        except subprocess.CalledProcessError:
+            print(f" {Color.ERROR}✗{Color.RESET} Failed: {pass_path}")
 
-    if successful_stores:
-        display_usage_instructions(successful_stores)
+    display_usage_instructions(provider_type, env_name)
 
 if __name__ == "__main__":
-    # Disable default help behavior so we can safely hijack -h and --help
-    parser = argparse.ArgumentParser(
-        description="epass: Secure copy-paste wrapper for pass storage initialization.",
-        add_help=False
-    )
-    parser.add_argument("-u", "--user", type=str, help="Explicit user/account identity override for GPG generation context.")
-    parser.add_argument("-h", "--help", action="store_true", help="Show this help message layout along with all current password store items formatted as shell environment injection snippets.")
-    
+    parser = argparse.ArgumentParser(description="epass: Secure copy-paste wrapper for gopass and age.", add_help=False)
+    parser.add_argument("-h", "--help", action="store_true")
     args = parser.parse_args()
 
-    # Route out right away if help flags are present
     if args.help:
         print_custom_help_and_exit(parser)
 
     try:
-        setup_gpg_and_pass(cli_user=args.user)
+        setup_gopass_and_age()
         raw_paste = capture_masked_paste()
-        store_in_pass(raw_paste)
+        store_in_gopass(raw_paste)
     except KeyboardInterrupt:
-        print(f"\n\n{Color.WARNING}Operation aborted by user. Exiting cleanly.{Color.RESET}")
+        print(f"\n\n{Color.WARNING}Operation aborted by user.{Color.RESET}")
         sys.exit(0)
