@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+#
+# ==============================================================================
+# SCRIPT: epass
+# DESCRIPTION:
+#   An interactive utility designed to parse raw configuration blocks or environment 
+#   variables and securely commit them into a local 'gopass' (age-encrypted) storage.
+#   It processes variables based on key=value pairings, auto-detects common cloud
+#   providers (e.g., AWS, GCP, Azure, GitHub) or lets you provision custom, freeform
+#   top-level directories, organized neatly under a chosen target namespace (dev/prod/test).
+#
+# REQUIREMENTS:
+#   - Python 3.x
+#   - 'gopass' (The Next-Generation Password Manager binary) installed and accessible.
+# ==============================================================================
+#
+
+import re
+import sys
+import termios
+import tty
+import subprocess
+import os
+import shutil
+import argparse
+
+# Audit Item 1: Strict pattern verification to avoid injection inside shell code or file layout paths
+VALID_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+class Color:
+    def __init__(self, scheme="SOLAR"):
+        if scheme.upper() == "DEFAULT":
+            self.HEADER = '\033[1;34m'
+            self.PROMPT = '\033[36m'
+            self.SUCCESS = '\033[32m'
+            self.WARNING = '\033[33m'
+            self.ERROR = '\033[31m'
+            self.DIM = '\033[2m'
+            self.RESET = '\033[0m'
+        elif scheme.upper() == "SOLAR":
+            self.HEADER = '\033[1;35m'
+            self.PROMPT = '\033[36m'
+            self.SUCCESS = '\033[32m'
+            self.WARNING = '\033[1;33m'
+            self.ERROR = '\033[1;31m'
+            self.DIM = '\033[37m'
+            self.RESET = '\033[0m'
+
+Color = Color(scheme="SOLAR")
+
+def setup_gopass_and_age():
+    """Verifies gopass capability, enforces core.useagent, and self-heals broken stores."""
+    print(f"{Color.HEADER}Verifying gopass capability and backend availability...{Color.RESET}")
+    
+    config_file = os.path.expanduser("~/.config/gopass/config")
+    default_store_path = os.path.expanduser("~/.local/share/gopass/stores/root")
+    
+    try:
+        subprocess.run(['gopass', 'version'], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print(f"{Color.ERROR}Critical: 'gopass' binary is not installed or accessible in PATH.{Color.RESET}")
+        sys.exit(1)
+
+    # Multi-tier functional probe check to bypass empty/broken false-positives
+    is_fully_functional = False
+    if os.path.exists(config_file) and os.path.exists(default_store_path):
+        try:
+            test_path = "healthcheck/probe"
+            subprocess.run(
+                ['gopass', 'insert', '--force', test_path],
+                input="probe_status_ok", text=True, capture_output=True, check=True
+            )
+            subprocess.run(['gopass', 'rm', '--force', test_path], capture_output=True, check=True)
+            is_fully_functional = True
+        except subprocess.CalledProcessError:
+            is_fully_functional = False
+
+    if is_fully_functional:
+        print(f"{Color.SUCCESS}Gopass store verified, active, and fully writeable.{Color.RESET}")
+        # Enforce memory caching agent usage to unblock downstream subshells
+        subprocess.run(['gopass', 'config', 'core.useagent', 'true'], capture_output=True)
+    else:
+        print(f"\n{Color.WARNING}Gopass store is uninitialized or in a broken state.{Color.RESET}")
+        print(f"{Color.DIM}Resetting configuration environment for clean 'age' initialization...{Color.RESET}")
+        
+        for path in [config_file, default_store_path]:
+            if os.path.exists(path):
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except Exception:
+                    pass
+
+        if sys.stdin.isatty():
+            os.environ["GPG_TTY"] = os.ttyname(sys.stdin.fileno())
+
+        try:
+            print(f"{Color.DIM}Launching native gopass wizard (age crypto + flat filesystem)...{Color.RESET}")
+            subprocess.run(['gopass', 'setup', '--crypto', 'age', '--storage', 'fs'], check=True)
+            # Post-setup optimization enforcement
+            subprocess.run(['gopass', 'config', 'core.useagent', 'true'], capture_output=True)
+            print(f"\n{Color.SUCCESS}Gopass vault setup successfully initialized with age encryption.{Color.RESET}")
+        except subprocess.CalledProcessError:
+            print(f"\n{Color.ERROR}Initialization workflow aborted or failed.{Color.RESET}")
+            sys.exit(1)
+
+def capture_masked_paste():
+    print(f"\n{Color.HEADER}Please paste your variables to store in key=value format{Color.RESET}")
+    print(f"{Color.DIM}--> Press Enter + Ctrl+D when finished. Press Ctrl+C or ESC to cancel. <--{Color.RESET}")
+    print(f"{Color.PROMPT}Paste now: {Color.RESET}", end="", flush=True)
+    
+    pasted_input = []
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    cancelled = False
+
+    try:
+        tty.setraw(fd)
+        while True:
+            char = sys.stdin.read(1)
+            if char == '\x04': 
+                break
+            if char in ('\x1b', '\x03'):
+                cancelled = True
+                break
+            pasted_input.append(char)
+            sys.stdout.write('\r\n' if char in ('\n', '\r') else '*')
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        
+    if cancelled:
+        print(f"\n{Color.WARNING}Paste window cancelled by user.{Color.RESET}")
+        sys.exit(0)
+        
+    return "".join(pasted_input)
+
+def detect_provider(var_name):
+    v = var_name.upper()
+    if v.startswith("AWS_"): return "aws"
+    elif v.startswith("GITHUB_") or v.startswith("GH_"): return "github"
+    elif v.startswith("AZURE_") or v.startswith("ARM_"): return "azure"
+    elif v.startswith("GOOGLE_") or v.startswith("GCP_") or v.startswith("GCLOUD_"): return "google"
+    elif v.startswith("DIGITALOCEAN_") or v.startswith("DO_"): return "digitalocean"
+    return "other"
+
+def strip_ansi(text):
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
+
+def get_toplevel_credential_types():
+    try:
+        result = subprocess.run(['gopass', 'ls'], capture_output=True, text=True)
+        lines = result.stdout.splitlines()
+        toplevels = []
+        for line in lines:
+            clean_line = strip_ansi(line).strip()
+            match = re.match(r'^[├└]──\s+([a-zA-Z0-9_\-]+)', clean_line)
+            if match:
+                toplevels.append(match.group(1))
+            elif re.match(r'^[a-zA-Z0-9_\-]+$', clean_line):
+                toplevels.append(clean_line)
+        return sorted(list(set(toplevels)))
+    except Exception:
+        return []
+
+def get_all_gopass_entries():
+    try:
+        result = subprocess.run(['gopass', 'list', '--flat'], capture_output=True, text=True)
+        if result.returncode != 0:
+            return []
+        
+        entries = []
+        for line in result.stdout.splitlines():
+            pass_path = line.strip()
+            if not pass_path:
+                continue
+            var_name = pass_path.split('/')[-1]
+            if VALID_KEY.match(var_name):
+                entries.append((var_name, pass_path))
+        return sorted(entries, key=lambda x: x[1])
+    except Exception:
+        return []
+
+def gopass_entry_exists(pass_path):
+    try:
+        res = subprocess.run(['gopass', 'show', pass_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def parse_paste_blob(text_blob):
+    variables = []
+    skipped = []
+    lines = text_blob.splitlines()
+    for line in lines:
+        line_str = line.strip()
+        if line_str.startswith("export "):
+            line_str = line_str[7:].strip()
+        if not line_str or "=" not in line_str:
+            continue
+        
+        key, val = line_str.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        
+        if len(val) >= 2 and ((val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'"))):
+            val = val[1:-1].strip()
+            
+        if key:
+            if VALID_KEY.match(key):
+                variables.append((key, val))
+            else:
+                skipped.append(key)
+    return variables, skipped
+
+def display_usage_instructions(provider, env):
+    """Generates an explicit copy-paste evaluation loop snippet."""
+    folder_path = f"{provider}/{env}"
+    print(f"\n{Color.HEADER}To inject these credentials into your active shell environment, run:{Color.RESET}")
+    print(f"----------------------------------------------------------------------")
+    print(f"for secret in $(gopass list --flat {folder_path}); do")
+    print(f"  var_name=${{secret##*/}}")
+    print(f"  export \"$var_name\"=\"$(gopass show -f $secret)\"")
+    print(f"done")
+    print(f"----------------------------------------------------------------------")
+    print(f"{Color.DIM}* Note: Your master passphrase will be requested once to prime the agent,{Color.RESET}")
+    print(f"{Color.DIM}  and all keys will populate cleanly without subshell pinentry hangs.{Color.RESET}")
+
+def print_custom_help_and_exit(parser):
+    parser.print_help()
+    print(f"\n{Color.HEADER}Current Gopass Store Injection Commands:{Color.RESET}")
+    print(f"----------------------------------------------------------------------")
+    
+    entries = get_all_gopass_entries()
+    if entries:
+        namespaces = sorted(list(set([ '/'.join(p[1].split('/')[:-1]) for p in entries ])))
+        for ns in namespaces:
+            print(f"{Color.SUCCESS}# Load {ns} Environment:{Color.RESET}")
+            print(f"for secret in $(gopass list --flat {ns}); do var_name=${{secret##*/}}; export \"$var_name\"=\"$(gopass show -f $secret)\"; done\n")
+    else:
+        print(f"  {Color.DIM}(No encrypted items found inside your root gopass store){Color.RESET}")
+    print(f"----------------------------------------------------------------------")
+    sys.exit(0)
+
+def store_in_gopass(text_blob):
+    variables, skipped = parse_paste_blob(text_blob)
+    
+    if skipped:
+        print(f"\n{Color.WARNING}Security Warning: Ignored inputs due to invalid formatting:{Color.RESET}")
+        for invalid_item in skipped:
+            print(f"  {Color.ERROR}!{Color.RESET} {invalid_item[:50]}")
+    
+    if not variables:
+        print(f"\n{Color.ERROR}No safe variable pairs discovered.{Color.RESET}")
+        return
+
+    print(f"\n{Color.SUCCESS}Parsed {len(variables)} variables successfully.{Color.RESET}")
+    
+    detected_providers = [detect_provider(k) for k, _ in variables]
+    provider_type = detected_providers[0] if "other" not in detected_providers else None
+    
+    if not provider_type:
+        while True:
+            toplevels = get_toplevel_credential_types()
+            print(f"{Color.HEADER}Top-level credential folders:{Color.RESET}")
+            for idx, folder in enumerate(toplevels, 1):
+                print(f"  [{idx}] {folder}")
+            
+            selection = input(f"{Color.PROMPT}Select index or type a new name: {Color.RESET}").strip()
+            if not selection:
+                provider_type = "other"
+                break
+            try:
+                idx_val = int(selection)
+                if 1 <= idx_val <= len(toplevels):
+                    provider_type = toplevels[idx_val - 1]
+                    break
+            except ValueError:
+                if re.match(r'^[a-z0-9_-]+$', selection.lower()) and not selection[0].isdigit():
+                    provider_type = selection.lower()
+                    break
+                print(f"{Color.ERROR}Invalid directory name standard.{Color.RESET}\n")
+
+    while True:
+        env_name = input(f"{Color.PROMPT}Enter environment namespace (dev, prod, test): {Color.RESET}").strip().lower()
+        if env_name in ['dev', 'prod', 'test']: break
+        print(f"{Color.ERROR}Invalid environment.{Color.RESET}")
+
+    collisions = [f"{provider_type}/{env_name}/{k}" for k, _ in variables if gopass_entry_exists(f"{provider_type}/{env_name}/{k}")]
+
+    if collisions:
+        print(f"\n{Color.WARNING}Collision Warning! Paths exist:{Color.RESET}")
+        for path in collisions: print(f"  ! {path}")
+        choice = input(f"\n{Color.PROMPT}Overwrite all? [1=Yes, 2=Re-choose destination, 3=Cancel]: {Color.RESET}").strip()
+        if choice == '2': return store_in_gopass(text_blob)
+        if choice != '1': return
+
+    print(f"\n{Color.HEADER}Storing credentials into gopass...{Color.RESET}")
+    
+    for var_name, var_value in variables:
+        pass_path = f"{provider_type}/{env_name}/{var_name}"
+        try:
+            subprocess.run(
+                ['gopass', 'insert', '--force', pass_path],
+                input=var_value, text=True, check=True, 
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+            print(f" {Color.SUCCESS}✓{Color.RESET} Stored: {Color.DIM}{pass_path}{Color.RESET}")
+        except subprocess.CalledProcessError:
+            print(f" {Color.ERROR}✗{Color.RESET} Failed: {pass_path}")
+
+    display_usage_instructions(provider_type, env_name)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="epass: Secure copy-paste wrapper for gopass and age.", add_help=False)
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+
+    if args.help:
+        print_custom_help_and_exit(parser)
+
+    try:
+        setup_gopass_and_age()
+        raw_paste = capture_masked_paste()
+        store_in_gopass(raw_paste)
+    except KeyboardInterrupt:
+        print(f"\n\n{Color.WARNING}Operation aborted by user.{Color.RESET}")
+        sys.exit(0)

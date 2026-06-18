@@ -9,4 +9,5 @@ Various utilities for Linux administration. These are AI-assisted, work-in-progr
 - [nvidia]: Real-time GTK3 GPU/CPU monitor with scrolling graphs.
 - [pass]: Interactive GPG + pass(1) password manager CLI wrapper.
 - [shell]: Assorted shell and Python utilities for USB, networking, window management, disk info, and SSH.
-- apt-hist: Parses `/var/log/dpkg.log` and reports package install/remove history in a condensed format.
+- [apt-hist]: Parses `/var/log/dpkg.log` and reports package install/remove history in a condensed format.
+- [toggle-size]: Hot key for cinnamon desktop for toggling the size of an application window between it's current geometry and fullscreen
