@@ -3,7 +3,7 @@
 A python wrapper for [[gopass](https://github.com/gopasspw/gopass)]
 (Claude was leveraged for much of the development)
 
-| In Use | Still Fixing |
+| In Use | Still Tuning |
 |--------|--------------|
 | ✅     | ✅           |
 
