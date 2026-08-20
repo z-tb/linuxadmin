@@ -1,16 +1,18 @@
 # epass
 
 A python wrapper for [[gopass](https://github.com/gopasspw/gopass)]
+(Claude was leveraged for much of the development)
 
 | In Use | Still Fixing |
 |--------|--------------|
-| ✅     |              |
+| ✅     | ✅           |
 
 epass is an environment and secret management utility intended for use within interactive containerized workflows, especially in environments where AI tools are present. Working as a wrapper around gopass, epass will run a first-time init of gopass using GnuPG as the encryption. The storage is intended to be ephemeral, so when the container closes, the secrets are gone too. During this first-time init, epass will also offer to install a set of shell helper functions (`eload`, `ezap`, `elist`, `eshow`, `elock`) to `~/.epassrc`, and include in your ~/.bashrc or ~/.zshrc so injecting and clearing credentials in your shell is a single command.
 
 After initialization, you can store a secret by running epass again and you will be prompted for data to store. epass will accept the pasted data as a multi-line blob (such as AWS credentials) and only echo '*' characters via a masked paste operation. This keeps the pasted data out of shell history and terminal scrollback, and unencrypted local files like ~/.aws/credentials.
 
 Since we use GnuPG for the encryption, a default credential timeout of 1 hour is applied (maybe Age will have this one day). This minimizes the amount of time the password store is accessible, and can be tuned at runtime with the --ttl parameter - accepting a bare number of hours, or a value suffixed with s/m/h (e.g. --ttl 30m) for finer control. A separate --max-ttl hard-caps the cache regardless of activity, defaulting to 4 hours.
+
 
 ## shell helpers
 | Command | What it does |
@@ -23,7 +25,7 @@ Since we use GnuPG for the encryption, a default credential timeout of 1 hour is
 | `ehelp` | Prints this list. |
 
 
-## Initial epass setu - 5 minute key cache
+## Initial epass setup - 5 minute key cache
 
 ![alt text](images/ep1.png)
 
