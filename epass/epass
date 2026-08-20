@@ -1,45 +1,13 @@
 #!/usr/bin/env python3
+#
 # ==============================================================================
 # SCRIPT: epass
 # DESCRIPTION:
-#   An secret management utility designed to parse raw configuration blocks or environment 
-#   variables and securely commit them as multi-line shell-export blocks into 'gopass'
-#   using GPG encryption (`gopass@local`).  This utility was developed with containerized
-#   AI workflows in mind where leaking credentials via cut/paste becomes more likely with
-#   no great way to mitigate.  This utility allows for a single paste operation that
-#   eliminates leaking secrets through plaintext files, shell history or terminal output
-#   and scrollback. The secrets are stored in encrypted storeage using a temporary key
-#   that both cease to exist when the container exits.
-#
-#   It auto-detects common cloud providers (e.g., AWS, GCP, Azure, GitHub) or lets
-#   you provision custom, freeform top-level directories, organized under a 
-#   chosen target environment namespace (dev/prod/test).
-#
-# REQUIREMENTS:
-#   - Python 3.x
-#   - GnuPG (`gpg`, `gpg-agent`, `gpgconf`)
-#   - 'gopass' (The Next-Generation Password Manager binary) installed and accessible.
-#
-# USAGE INSTRUCTIONS:
-#   1. Execute the tool: ./epass [OPTIONS]
-#   2. Paste your lines formatted as raw `KEY=VALUE` or standard shell `export KEY="VALUE"`.
-#   3. Finalize the stream paste capture by issuing: Enter -> Ctrl+D
-#   4. Choose your structural folder routing and target environment when prompted.
-#   5. Evaluate secrets in your shell using the companion `eload <path>` function.
-#
-# OPTIONS:
-#   -h, --help        Display custom help menu showing stored credential paths.
-#   --init            Install epass shell helpers (`eload`, `ezap`, `elist`, etc.)
-#                     into ~/.epassrc and link them to ~/.bashrc or ~/.zshrc.
-#   --reset           Wipe local gopass stores and delete the `gopass@local` GPG keypair.
-#   --ttl HOURS       Inactivity passphrase cache timeout in hours (default: 1.0).
-#   --max-ttl HOURS   Maximum passphrase cache timeout in hours (default: 24.0).
-#
-# NOTE:
-#   Abort input processing cleanly at any stage by issuing Ctrl+C or ESC.
-#   Age encryption might be nicer but doesn't allow for gpg-style caching of the secret
-#   which may or may not be desired.
+#   An interactive utility designed to parse raw configuration blocks or environment
+#   variables and securely commit them as multi-line environment blobs into 'gopass'
+#   using GPG encryption.
 # ==============================================================================
+#
 
 import re
 import sys
@@ -52,6 +20,43 @@ import argparse
 import getpass
 
 VALID_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def parse_ttl_hours(value):
+    """
+    Parses a --ttl/--max-ttl value into hours (float).
+
+    Accepts a bare number (hours, kept for backward compatibility with the
+    original --ttl 2 style), or a number suffixed with:
+      s  seconds   e.g. 45s
+      m  minutes   e.g. 30m
+      h  hours     e.g. 2h  (same as a bare number)
+    """
+    if value is None or not value.strip():
+        raise argparse.ArgumentTypeError("TTL value cannot be empty.")
+
+    text = value.strip().lower()
+    unit_map = {'s': 1 / 3600, 'm': 1 / 60, 'h': 1.0}
+
+    if text[-1] in unit_map:
+        number_part = text[:-1]
+        multiplier = unit_map[text[-1]]
+    else:
+        number_part = text
+        multiplier = 1.0  # bare numbers are hours, for backward compatibility
+
+    try:
+        number = float(number_part)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid TTL value '{value}'. Use a number optionally suffixed with "
+            f"'s' (seconds), 'm' (minutes), or 'h' (hours) — e.g. 45s, 30m, 2h, or a bare '1.5' for hours."
+        )
+
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"TTL value must be greater than zero, got '{value}'.")
+
+    return number * multiplier
 
 
 class Color:
@@ -77,8 +82,13 @@ class Color:
 Color = Color(scheme="SOLAR")
 
 
-def install_shell_wrapper():
-    """Writes full epass shell suite to ~/.epassrc and optionally links it in shell config."""
+def install_shell_wrapper(exit_after=True):
+    """Writes full epass shell suite to ~/.epassrc and optionally links it in shell config.
+
+    exit_after=True is the original standalone `epass --init` behavior (install, then exit).
+    exit_after=False lets this be called mid-flow (e.g. right after first-time vault setup)
+    without terminating the process, so the caller can continue on to capture/store a secret.
+    """
     epassrc_path = os.path.expanduser("~/.epassrc")
 
     function_block = (
@@ -171,7 +181,8 @@ def install_shell_wrapper():
     print(f"  {Color.HEADER}eshow <path>{Color.RESET}   - View raw credential exports")
     print(f"  {Color.HEADER}elock{Color.RESET}          - Purge GPG passphrase cache immediately")
     print(f"  {Color.HEADER}ehelp{Color.RESET}          - Display help menu\n")
-    sys.exit(0)
+    if exit_after:
+        sys.exit(0)
 
 
 def reset_epass():
@@ -206,7 +217,40 @@ def reset_epass():
     sys.exit(0)
 
 
-def configure_gpg_agent(ttl_hours=1, max_ttl_hours=24):
+def format_hours(hours):
+    """Renders a duration (given in hours) using whichever unit reads cleanest."""
+    seconds = hours * 3600
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f}m" if minutes == int(minutes) else f"{minutes:.1f}m"
+    return f"{hours:.0f}h" if hours == int(hours) else f"{hours:.2f}h"
+
+
+def read_configured_ttl_hours():
+    """
+    Reads back whatever default-cache-ttl / max-cache-ttl are currently set in
+    ~/.gnupg/gpg-agent.conf, in hours. Returns (ttl_hours, max_ttl_hours), with
+    None for either value that isn't present (e.g. no prior epass run yet).
+    """
+    agent_conf = os.path.expanduser("~/.gnupg/gpg-agent.conf")
+    ttl_hours = None
+    max_ttl_hours = None
+    if os.path.exists(agent_conf):
+        with open(agent_conf, "r") as f:
+            for line in f:
+                stripped = line.strip()
+                m = re.match(r'^default-cache-ttl\s+(\d+)', stripped)
+                if m:
+                    ttl_hours = int(m.group(1)) / 3600
+                m = re.match(r'^max-cache-ttl\s+(\d+)', stripped)
+                if m:
+                    max_ttl_hours = int(m.group(1)) / 3600
+    return ttl_hours, max_ttl_hours
+
+
+def configure_gpg_agent(ttl_hours=1, max_ttl_hours=4):
     """Configures gpg-agent to cache passphrases across runs using custom TTLs."""
     gnupg_dir = os.path.expanduser("~/.gnupg")
     os.makedirs(gnupg_dir, mode=0o700, exist_ok=True)
@@ -252,7 +296,7 @@ def configure_gpg_agent(ttl_hours=1, max_ttl_hours=24):
 
     try:
         subprocess.run(['gpgconf', '--reload', 'gpg-agent'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"{Color.DIM}✓ Configured gpg-agent cache duration to {ttl_hours}h (max {max_ttl_hours}h). Customize via --ttl and --max-ttl.{Color.RESET}")
+        print(f"{Color.DIM}✓ Configured gpg-agent cache duration to {format_hours(ttl_hours)} (max {format_hours(max_ttl_hours)}). Customize via --ttl and --max-ttl.{Color.RESET}")
     except Exception:
         pass
 
@@ -300,7 +344,22 @@ def ensure_gpg_identity():
         pass2 = None
 
 
-def setup_gopass(ttl_hours=1, max_ttl_hours=24):
+def disable_gopass_autosync():
+    """
+    Disables gopass's git autosync step (core.autosync). Every epass store is
+    initialized with --storage=fs, so there's never a git repo to sync with —
+    without this, every `gopass show`/`eshow` prints a "Syncing with all
+    remotes..." banner that just announces it's skipping something that was
+    never going to happen. Best-effort: failing to set this isn't fatal.
+    """
+    try:
+        subprocess.run(['gopass', 'config', 'core.autosync', 'false'],
+                        capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+
+
+def setup_gopass(ttl_hours=1, max_ttl_hours=4):
     """Verifies gopass capability and initializes store with GPG backend if needed."""
     print(f"{Color.HEADER}Verifying gopass capability and GPG store status...{Color.RESET}")
 
@@ -328,6 +387,7 @@ def setup_gopass(ttl_hours=1, max_ttl_hours=24):
 
     if is_fully_functional:
         configure_gpg_agent(ttl_hours=ttl_hours, max_ttl_hours=max_ttl_hours)
+        disable_gopass_autosync()
         print(f"{Color.SUCCESS}Gopass store verified, active, and fully writeable.{Color.RESET}\n")
     else:
         print(f"\n{Color.WARNING}Gopass store is uninitialized or inaccessible.{Color.RESET}")
@@ -341,11 +401,32 @@ def setup_gopass(ttl_hours=1, max_ttl_hours=24):
 
         print(f"{Color.DIM}Initializing gopass vault with gopass@local identity...{Color.RESET}")
         try:
-            subprocess.run(['gopass', 'init', 'gopass@local'], check=True)
+            # --storage=fs avoids gopass's default gitfs backend, which needs git
+            # commit-author metadata (user.name/user.email) and prompts for it
+            # interactively on a fresh container with no git config — an unrelated,
+            # confusing second "email address" prompt on top of the GPG recipient
+            # already set above. There's also no upside to git-backed storage here:
+            # the store is throwaway and container-local, nothing to push to, and
+            # git history would otherwise retain old ciphertext after rotation.
+            subprocess.run(['gopass', 'init', '--storage=fs', 'gopass@local'], check=True)
+            disable_gopass_autosync()
             print(f"\n{Color.SUCCESS}Gopass vault setup successfully initialized.{Color.RESET}\n")
         except subprocess.CalledProcessError:
             print(f"\n{Color.ERROR}Initialization workflow failed.{Color.RESET}")
             sys.exit(1)
+
+        # First time this vault has been set up in this environment — this is the
+        # natural moment to offer the eload/ezap/elist/eshow/elock shell helpers too,
+        # rather than only mentioning --init as an afterthought once a secret is stored.
+        # Skipped silently if ~/.epassrc already exists (already installed, or the user
+        # declined before on this same filesystem — don't nag on every run).
+        epassrc_path = os.path.expanduser("~/.epassrc")
+        if not os.path.exists(epassrc_path):
+            install_choice = input(
+                f"{Color.PROMPT}Install epass shell helpers (eload, ezap, elist, eshow, elock) to ~/.epassrc? [Y/n]: {Color.RESET}"
+            ).strip().lower()
+            if install_choice not in ('n', 'no'):
+                install_shell_wrapper(exit_after=False)
 
 
 def capture_masked_paste():
@@ -502,7 +583,15 @@ def display_usage_instructions(entry_path):
     print(f"----------------------------------------------------------------------")
     print(f"eload {entry_path}")
     print(f"----------------------------------------------------------------------")
-    print(f"{Color.DIM}* Run 'epass --init' once if shell commands are not installed.{Color.RESET}\n")
+
+    # ~/.epassrc gets linked into .bashrc/.zshrc for future shells, but that
+    # doesn't reach the shell that's running right now — rc files are only
+    # read at shell startup, not retroactively. So if it's installed, the
+    # useful tip is "source it now", not the old blanket "run --init" line.
+    if os.path.exists(os.path.expanduser("~/.epassrc")):
+        print(f"{Color.DIM}* First time this session? Run 'source ~/.epassrc' to load eload/ezap/elist/eshow/elock.{Color.RESET}\n")
+    else:
+        print(f"{Color.DIM}* Shell helpers aren't installed yet — run 'epass --init' to add eload/ezap/elist/eshow/elock.{Color.RESET}\n")
 
 
 def print_custom_help_and_exit(parser):
@@ -622,12 +711,14 @@ def store_in_gopass(text_blob):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="epass: Multi-line gopass storage for single-prompt eval loading.", add_help=False)
+    parser = argparse.ArgumentParser(description="epass: Wrapper for gopass storage and secret loading.", add_help=False)
     parser.add_argument("-h", "--help", action="store_true")
-    parser.add_argument("--init", action="store_true", help="Install epass shell helpers into ~/.epassrc and include in ~/.bashrc or ~/.zshrc.")
-    parser.add_argument("--reset", action="store_true", help="Wipe gopass stores and remove gopass@local GPG key identity.")
-    parser.add_argument("--ttl", type=float, default=1.0, help="Inactivity cache timeout in hours (default: 1)")
-    parser.add_argument("--max-ttl", type=float, default=24.0, help="Maximum cache timeout in hours (default: 24)")
+    parser.add_argument("--init", action="store_true", help="Install epass shell helpers into ~/.epassrc. Includes in ~/.bashrc or ~/.zshrc.")
+    parser.add_argument("--reset", action="store_true", help="Wipe gopass stores and remov GPG keys/identity.")
+    parser.add_argument("--ttl", type=parse_ttl_hours, default=None,
+                         help="Inactivity cache timeout. (default: 1h). Use 's' or 'm' for seconds/minutes: --ttl 45s")
+    parser.add_argument("--max-ttl", type=parse_ttl_hours, default=None,
+                         help="Maximum cache timeout. (default: 4h). Use 's' or 'm' for seconds/minutes: --max-ttl 90m")
     args = parser.parse_args()
 
     if args.help:
@@ -639,8 +730,17 @@ if __name__ == "__main__":
     if args.reset:
         reset_epass()
 
+    # --ttl/--max-ttl are "sticky": if not explicitly passed this run, reuse
+    # whatever was last configured in gpg-agent.conf (from a prior epass run)
+    # instead of silently clobbering it back to the hardcoded default. The
+    # hardcoded default only applies the very first time, before anything's
+    # been configured yet.
+    configured_ttl, configured_max_ttl = read_configured_ttl_hours()
+    resolved_ttl = args.ttl if args.ttl is not None else (configured_ttl if configured_ttl is not None else 1.0)
+    resolved_max_ttl = args.max_ttl if args.max_ttl is not None else (configured_max_ttl if configured_max_ttl is not None else 4.0)
+
     try:
-        setup_gopass(ttl_hours=args.ttl, max_ttl_hours=args.max_ttl)
+        setup_gopass(ttl_hours=resolved_ttl, max_ttl_hours=resolved_max_ttl)
         raw_paste = capture_masked_paste()
         store_in_gopass(raw_paste)
     except KeyboardInterrupt:
